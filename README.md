@@ -23,5 +23,16 @@ Prerequisites: Docker Desktop & Git.
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/HUIYULEO/Industrial-RAG-assistant.git
-   cd industrial-rag-backend
+   cd industrial-rag
    ```
+2. **Set up Environment: Create a .env file with your credentials:**
+   '''env
+   OPENAI_API_KEY=sk-...
+   SUPABASE_URL=...
+   SUPABASE_SERVICE_KEY=...
+   '''
+3. **Deploy:**
+   ```bash
+   docker-compose up --build
+   ```
+   Access the UI at http://localhost:3000
