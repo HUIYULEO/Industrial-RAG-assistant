@@ -26,11 +26,11 @@ Prerequisites: Docker Desktop & Git.
    cd industrial-rag
    ```
 2. **Set up Environment: Create a .env file with your credentials:**
-   '''env
+   ```env
    OPENAI_API_KEY=sk-...
    SUPABASE_URL=...
    SUPABASE_SERVICE_KEY=...
-   '''
+   ```
 3. **Deploy:**
    ```bash
    docker-compose up --build
