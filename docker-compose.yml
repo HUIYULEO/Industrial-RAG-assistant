@@ -1,0 +1,24 @@
+services:
+  # Service 1: The Brain (FastAPI)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: industrial-rag-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env # Passes your OpenAI/Supabase keys automatically
+
+  # Service 2: The Face (Streamlit)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: industrial-rag-frontend
+    ports:
+      - "3000:8501"
+    environment:
+      - API_URL=http://backend:8000/chat
+    depends_on:
+      - backend
