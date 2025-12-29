@@ -22,6 +22,6 @@ Prerequisites: Docker Desktop & Git.
 
 1. **Clone the repository:**
    ```bash
-   git clone [YOUR_REPO_LINK]
+   git clone https://github.com/HUIYULEO/Industrial-RAG-assistant.git
    cd industrial-rag-backend
    ```
