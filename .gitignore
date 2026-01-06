@@ -6,6 +6,7 @@ __pycache__/
 .env
 .vscode/
 .idea/
+UPGRADE_GUIDE.md
 
 #database files
 data/
