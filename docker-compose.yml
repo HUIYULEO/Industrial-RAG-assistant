@@ -9,6 +9,11 @@ services:
       - "8000:8000"
     env_file:
       - .env # Passes your OpenAI/Supabase keys automatically
+    volumes:
+      - ./app:/app/app
+      - ./scripts:/app/scripts
+      - ./logs:/app/logs
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   # Service 2: The Face (Streamlit)
   frontend:
@@ -20,5 +25,9 @@ services:
       - "3000:8501"
     environment:
       - API_URL=http://backend:8000/chat
+      - STREAMLIT_SERVER_FILE_WATCHER_TYPE=auto
+      - STREAMLIT_SERVER_RUNON_SAVE=true
+    volumes:
+      - ./app:/app/app
     depends_on:
       - backend

@@ -18,7 +18,7 @@ supabase = create_client(supabase_url, supabase_key)
 # Initialize OpenAI Embeddings (The model that turns text into math)
 embeddings = OpenAIEmbeddings()
 
-def upload_documents_to_supabase(chunks):
+def upload_documents_to_supabase(chunks: list[str]) -> SupabaseVectorStore:
     """
     Takes a list of text chunks, generates embeddings, 
     and inserts them into the 'documents' table in Supabase.
