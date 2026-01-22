@@ -7,10 +7,11 @@ __pycache__/
 .vscode/
 .idea/
 UPGRADE_GUIDE.md
-CLAUDE.md
+IMPROVEMENT_PLAN.md
 
 #database files
 data/
+*.pdf
 
 #log files
 logs/
