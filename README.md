@@ -36,3 +36,16 @@ Prerequisites: Docker Desktop & Git.
    docker-compose up --build
    ```
    Access the UI at http://localhost:3000
+   
+## What I Learned
+Working on this project deepened my understanding of:
+- Vector embeddings and similarity search
+- LLM prompt engineering and context management
+- RAG architecture and retrieval optimization
+
+## V2 Roadmap
+Currently working on V2:
+- add LangGraph Agent Flow with three tools: RAG Search, Web Search, Calculator
+- Improved chunking strategies
+- Hybrid search (semantic + keyword)
+- Add RAG Evaluation Pipeline 
