@@ -2,6 +2,9 @@
 # Python virtual environment
 .venv/
 .venv-clean/
+.uv-cache/
+.uv-python/
+.pytest-tmp/
 frontend-next/node_modules/
 frontend-next/.next/
 __pycache__/

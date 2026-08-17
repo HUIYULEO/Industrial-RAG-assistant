@@ -93,7 +93,8 @@ industrial-rag/
 ├── docker-compose.yml               # Service orchestration
 ├── Dockerfile.backend               # Backend container
 ├── Dockerfile.frontend              # Frontend container
-├── requirements.txt                 # Python dependencies
+├── pyproject.toml                   # Python dependency definitions
+├── uv.lock                          # Locked Python dependencies
 ├── .env                             # Environment variables (not in git)
 └── README.md                        # This file
 ```
@@ -104,7 +105,7 @@ industrial-rag/
 
 ### Prerequisites
 
-- **Docker Desktop** (recommended) or Python 3.10+
+- **Docker Desktop** (recommended) or [uv](https://docs.astral.sh/uv/)
 - **Git**
 - **OpenAI API Key** ([Get one here](https://platform.openai.com/api-keys))
 - **Supabase Account** ([Sign up here](https://supabase.com/))
@@ -166,30 +167,23 @@ industrial-rag/
 
 ### Option 2: Local Development
 
-1. **Create virtual environment**
+1. **Install and synchronize the locked environment**
 
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   uv sync
    ```
 
-2. **Install dependencies**
+2. **Set up environment variables** (same as above)
+
+3. **Run backend**
 
    ```bash
-   pip install -r requirements.txt
+   uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
    ```
 
-3. **Set up environment variables** (same as above)
-
-4. **Run backend**
-
+4. **Run frontend** (in another terminal)
    ```bash
-   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-   ```
-
-5. **Run frontend** (in another terminal)
-   ```bash
-   streamlit run app/frontend.py --server.port 3000
+   uv run streamlit run app/frontend.py --server.port 3000
    ```
 
 ---

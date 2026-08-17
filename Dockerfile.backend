@@ -1,18 +1,21 @@
-# Use a lightweight Python base image
+# Use uv to install the locked Python dependencies.
+FROM ghcr.io/astral-sh/uv:0.9.24 AS uv
 FROM python:3.11-slim
 
 # Set working directory inside the container
 WORKDIR /app
 
-# Copy dependency file first (caching layer)
-COPY requirements.txt .
+# Copy the dependency metadata first to retain Docker layer caching.
+COPY --from=uv /uv /uvx /bin/
+COPY pyproject.toml uv.lock ./
 
-# Install dependencies
-# --no-cache-dir keeps the image small
-RUN pip install --no-cache-dir -r requirements.txt
+# Install only production dependencies from the committed lock file.
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy the rest of the application code
 COPY . .
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Expose the port FastAPI runs on
 EXPOSE 8000

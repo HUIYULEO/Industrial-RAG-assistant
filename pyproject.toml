@@ -1,0 +1,40 @@
+[project]
+name = "industrial-rag"
+version = "0.1.0"
+description = "Warehouse automation design decision assistant"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "duckduckgo-search==4.1.1",
+    "fastapi==0.128.0",
+    "langchain==0.3.27",
+    "langchain-community==0.3.31",
+    "langchain-openai==0.3.35",
+    "openpyxl==3.1.5",
+    "pandas==2.3.3",
+    "psycopg[binary]==3.2.9",
+    "pydantic-settings==2.11.0",
+    "pymilvus==2.6.4",
+    "pypdf==6.5.0",
+    "pyjwt==2.10.1",
+    "python-docx==1.1.2",
+    "python-dotenv==1.2.1",
+    "python-multipart>=0.0.20",
+    "redis==5.2.1",
+    "requests==2.32.5",
+    "rq==2.1.0",
+    "sqlalchemy==2.0.45",
+    "streamlit==1.50.0",
+    "supabase==2.27.0",
+    "uvicorn==0.39.0",
+    "pymupdf==1.26.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.2",
+    "pytest-cov==6.0.0",
+]
+
+[tool.uv]
+package = false
