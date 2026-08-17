@@ -1,5 +1,77 @@
 services:
-  # Service 1: The Brain (FastAPI)
+  # Durable task queue for independently processed URS analysis items.
+  redis:
+    image: redis:7-alpine
+    container_name: industrial-rag-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Local metadata and review-workspace data. Credentials are development-only.
+  postgres:
+    image: postgres:16-alpine
+    container_name: industrial-rag-postgres
+    environment:
+      POSTGRES_DB: design_review
+      POSTGRES_USER: design_review
+      POSTGRES_PASSWORD: design_review_local_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U design_review -d design_review"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Milvus standalone dependencies. Kept explicit to make local data persistent.
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: industrial-rag-milvus-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - milvus_etcd:/etcd
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: industrial-rag-milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data
+    volumes:
+      - milvus_minio:/minio_data
+
+  milvus:
+    image: milvusdb/milvus:v2.6.4
+    container_name: industrial-rag-milvus
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+
   backend:
     build:
       context: .
@@ -8,26 +80,65 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env # Passes your OpenAI/Supabase keys automatically
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://design_review:design_review_local_only@postgres:5432/design_review
+      MILVUS_URI: http://milvus:19530
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./app:/app/app
       - ./scripts:/app/scripts
+      - ./tests:/app/tests
       - ./logs:/app/logs
+      - ./data:/app/data
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_started
+      redis:
+        condition: service_healthy
 
-  # Service 2: The Face (Streamlit)
+  # Scale this service to process multiple URS items concurrently:
+  # docker compose up --scale analysis-worker=3
+  analysis-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://design_review:design_review_local_only@postgres:5432/design_review
+      MILVUS_URI: http://milvus:19530
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+    command: rq worker design-review --url redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
   frontend:
     build:
       context: .
       dockerfile: Dockerfile.frontend
     container_name: industrial-rag-frontend
     ports:
-      - "3000:8501"
+      - "3000:3000"
     environment:
-      - API_URL=http://backend:8000/chat
-      - STREAMLIT_SERVER_FILE_WATCHER_TYPE=auto
-      - STREAMLIT_SERVER_RUNON_SAVE=true
-    volumes:
-      - ./app:/app/app
+      BACKEND_URL: http://backend:8000
     depends_on:
       - backend
+
+volumes:
+  postgres_data:
+  milvus_etcd:
+  milvus_minio:
+  milvus_data:
+  redis_data:

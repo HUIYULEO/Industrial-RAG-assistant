@@ -1,9 +1,14 @@
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from app.schema import ChatRequest, ChatResponse, ErrorResponse
-from app.services.chat_engine import get_chat_response
+from app.api.reviews import router as design_review_router
+from app.api.auth import router as auth_router, require_authenticated_user
+from app.repositories.database import initialise_database
+from app.repositories.database import get_session_factory
+from app.core.config import get_settings
+from app.services.auth_service import AuthService, AuthenticatedUser
 from app.core.logging_config import setup_logging, get_logger
 from app.core.exceptions import (
     IndustrialRAGException,
@@ -21,17 +26,23 @@ logger = get_logger(__name__)
 # Session storage (in production, use Redis or database)
 chat_sessions = {}
 
+
+def get_chat_response(*args, **kwargs):
+    """Load the legacy OpenAI/Supabase proof-of-concept only when chat is used."""
+    from app.services.chat_engine import get_chat_response as legacy_get_chat_response
+    return legacy_get_chat_response(*args, **kwargs)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle management for the FastAPI application."""
     logger.info("Starting Industrial RAG Assistant API")
 
-    required_env_vars = ["OPENAI_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_KEY"]
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-
-    if missing_vars:
-        logger.error(f"Missing environment variables: {missing_vars}")
-        raise RuntimeError(f"Missing environment variables: {missing_vars}")
+    initialise_database()
+    db = get_session_factory()()
+    try:
+        AuthService(db, get_settings()).bootstrap_admin()
+    finally:
+        db.close()
 
     logger.info("Application startup complete")
 
@@ -47,6 +58,8 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan
 )
+app.include_router(design_review_router)
+app.include_router(auth_router)
 
 # Global exception handlers
 @app.exception_handler(IndustrialRAGException)
@@ -83,7 +96,10 @@ async def health_check():
     }
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(
+    request: ChatRequest,
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     """
     Main chat endpoint for warehouse automation design queries.
 
@@ -118,7 +134,9 @@ async def chat_endpoint(request: ChatRequest):
         response = get_chat_response(
             question=request.question,
             session_id=session_id,
-            chat_history=chat_sessions[session_id]["history"]
+            # Pass a snapshot so downstream processing cannot observe later
+            # mutations when this request is persisted in the session history.
+            chat_history=list(chat_sessions[session_id]["history"])
         )
 
         # Store in session history

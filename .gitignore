@@ -1,13 +1,15 @@
 
 # Python virtual environment
 .venv/
+.venv-clean/
+frontend-next/node_modules/
+frontend-next/.next/
 __pycache__/
 *.pyc
 .env
 .vscode/
 .idea/
-UPGRADE_GUIDE.md
-IMPROVEMENT_PLAN.md
+
 
 #database files
 data/
@@ -18,3 +20,7 @@ logs/
 *.log
 coverage
 archieve/tmpclaude-*
+
+#plan files
+UPGRADE_GUIDE.md
+IMPROVEMENT_PLAN.md

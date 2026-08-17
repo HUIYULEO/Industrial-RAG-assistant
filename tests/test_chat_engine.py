@@ -208,14 +208,12 @@ def test_get_chat_response_success(mock_llm, mock_retriever_class):
     mock_retriever_class.return_value = mock_retriever
 
     # Mock LLM chain response
-    with patch("app.services.chat_engine.create_retrieval_chain") as mock_chain:
+    with patch("app.services.chat_engine.create_stuff_documents_chain") as mock_chain:
         mock_chain_instance = MagicMock()
-        mock_chain_instance.invoke.return_value = {
-            "answer": "WCS manages warehouse operations and material flow."
-        }
+        mock_chain_instance.invoke.return_value = "WCS manages warehouse operations and material flow."
         mock_chain.return_value = mock_chain_instance
 
-        result = get_chat_response("What is WCS?")
+        result = get_chat_response("What is WCS?", use_hybrid_retrieval=False)
 
         assert "answer" in result
         assert "sources" in result
@@ -235,7 +233,7 @@ def test_get_chat_response_no_documents(mock_retriever_class):
     mock_retriever._get_relevant_documents.return_value = []
     mock_retriever_class.return_value = mock_retriever
 
-    result = get_chat_response("Unknown question")
+    result = get_chat_response("Unknown question", use_hybrid_retrieval=False)
 
     assert "answer" in result
     assert "couldn't find relevant information" in result["answer"].lower()
@@ -261,15 +259,16 @@ def test_get_chat_response_with_history(mock_llm, mock_retriever_class, sample_c
     mock_retriever_class.return_value = mock_retriever
 
     # Mock LLM chain
-    with patch("app.services.chat_engine.create_retrieval_chain") as mock_chain:
+    with patch("app.services.chat_engine.create_stuff_documents_chain") as mock_chain:
         mock_chain_instance = MagicMock()
-        mock_chain_instance.invoke.return_value = {"answer": "Response based on history"}
+        mock_chain_instance.invoke.return_value = "Response based on history"
         mock_chain.return_value = mock_chain_instance
 
         result = get_chat_response(
             "Follow-up question",
             session_id="test_session",
-            chat_history=sample_chat_history
+            chat_history=sample_chat_history,
+            use_hybrid_retrieval=False,
         )
 
         # Check that history context was included
@@ -294,8 +293,8 @@ def test_get_chat_response_llm_error(mock_llm, mock_retriever_class):
     mock_retriever_class.return_value = mock_retriever
 
     # Mock LLM to raise error
-    with patch("app.services.chat_engine.create_retrieval_chain") as mock_chain:
+    with patch("app.services.chat_engine.create_stuff_documents_chain") as mock_chain:
         mock_chain.side_effect = Exception("LLM API timeout")
 
         with pytest.raises(LLMException):
-            get_chat_response("Test question")
+            get_chat_response("Test question", use_hybrid_retrieval=False)

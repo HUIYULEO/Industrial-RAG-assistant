@@ -1,0 +1,14 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.py[cod]
+.env
+data
+logs
+coverage
+htmlcov
+frontend-next/node_modules
+frontend-next/.next
+archieve
+AGENTS.md

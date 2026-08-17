@@ -4,6 +4,8 @@ Tests for FastAPI main application endpoints.
 import pytest
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
+from app.api.auth import require_authenticated_user
+from app.services.auth_service import AuthenticatedUser
 
 
 @pytest.fixture
@@ -11,7 +13,12 @@ def client():
     """Create test client."""
     # Import here to avoid issues with env vars
     from app.main import app
-    return TestClient(app)
+    app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedUser(
+        email="test.engineer@example.com", display_name="Test Engineer", role="engineer"
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.pop(require_authenticated_user, None)
 
 
 def test_health_check(client):

@@ -1,0 +1,36 @@
+export type User = { email: string; display_name: string; role: string };
+export type AuthConfig = { authentication_required: boolean; self_registration_enabled: boolean; visual_analysis_enabled: boolean };
+export type DocumentVersion = {
+  id: string; title: string; document_type: string; system: string; vendor?: string | null; version: string;
+  ingestion_status: string; ingestion_error?: string | null; chunk_count: number; page_count?: number | null;
+};
+export type RequirementBaseline = { id: string; name: string; system: string; description?: string | null };
+export type ReviewPackage = { id: string; name: string; system: string; requirement_count: number; design_document_version_ids: string[] };
+export type Finding = {
+  id: string; requirement_code: string; requirement_text: string; design_status: string; rationale: string;
+  gap?: string | null; suggested_reviewer_action?: string | null;
+  evidence: { chunk_id: string; document_title: string; version: string; page?: number | null; section?: string | null; excerpt: string }[];
+  audit_points: AuditPoint[];
+};
+export type AuditPoint = {
+  point_id: string; source_excerpt: string; review_point: string; design_status: string;
+  status_definition: string; rationale: string;
+  evidence: { chunk_id: string; document_title: string; version: string; page?: number | null; section?: string | null; excerpt: string }[];
+};
+export type MatrixRow = {
+  requirement_code: string; requirement_text: string; rationale_impact?: string | null; is_critical: boolean;
+  priority?: string | null; category?: string | null; analysis_status: string; technical_error?: string | null;
+  design_status?: string | null; status_definition?: string | null; rationale?: string | null;
+  gap?: string | null; suggested_reviewer_action?: string | null;
+  evidence: { chunk_id: string; document_title: string; version: string; page?: number | null; section?: string | null; excerpt: string }[];
+  audit_points: AuditPoint[];
+};
+export type AnalysisProgress = {
+  id: string; status: string; error_message?: string | null; total_items: number; queued_items: number;
+  running_items: number; completed_items: number; failed_items: number;
+  items: { id: string; requirement_code: string; status: string; attempt_count: number; error_message?: string | null }[];
+};
+export type ChatAnswer = {
+  answer: string; retrieval_query: string; limitations?: string | null;
+  citations: { chunk_id: string; document_title: string; version: string; page?: number | null; section?: string | null; excerpt: string }[];
+};

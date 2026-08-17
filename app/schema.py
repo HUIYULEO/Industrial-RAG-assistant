@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field
 
 # Input Schema: What we expect from the user
 class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=1000, description="User's question about warehouse automation")
+    question: str = Field(..., description="User's question about warehouse automation")
     session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
 
     model_config = {
