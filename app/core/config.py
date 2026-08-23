@@ -19,9 +19,23 @@ class Settings(BaseSettings):
     default_output_language: str = "en"
     milvus_uri: str = "http://localhost:19530"
     milvus_collection: str = "knowledge_chunks"
+    # Chat and embeddings may use different providers. This permits, for
+    # example, comparing DeepSeek and Qwen answers on one frozen vector index.
+    llm_provider: str = "openai"
+    embedding_provider: str = "openai"
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
+    qwen_api_key: str | None = None
+    # DASHSCOPE_API_KEY is accepted as an equivalent, provider-native name.
+    dashscope_api_key: str | None = None
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
     chat_model: str = "gpt-4o"
+    llm_timeout_seconds: int = 60
+    llm_max_retries: int = 2
     max_upload_size_mb: int = 25
     auth_required: bool = True
     # Safe only for this local Docker workspace. Set a unique secret before sharing a deployment.
@@ -30,6 +44,11 @@ class Settings(BaseSettings):
     allow_self_registration: bool = True
     local_admin_email: str | None = None
     local_admin_password: str | None = None
+    local_admin_department: str = "DDIT"
+    ddit_admin_email: str | None = None
+    ddit_admin_password: str | None = None
+    qa_admin_email: str | None = None
+    qa_admin_password: str | None = None
     # Diagram pages remain available as source evidence by default. Vision-model
     # interpretation is an opt-in future capability, not part of the current RAG scope.
     enable_visual_analysis: bool = False

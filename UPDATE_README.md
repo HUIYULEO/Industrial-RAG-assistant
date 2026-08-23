@@ -2,7 +2,7 @@
 
 > A local, version-aware RAG workspace for engineering review of warehouse-automation supplier design documents.
 
-This document describes the current implementation. It supersedes the architecture descriptions in the legacy `README.md`, which refer to the earlier Supabase and open-web-search prototype.
+This document describes the current implementation of the controlled design-review workspace.
 
 ## 1. Purpose and operating boundary
 

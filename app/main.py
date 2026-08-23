@@ -1,216 +1,72 @@
-import os
-from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.responses import JSONResponse
-from app.schema import ChatRequest, ChatResponse, ErrorResponse
-from app.api.reviews import router as design_review_router
-from app.api.auth import router as auth_router, require_authenticated_user
-from app.repositories.database import initialise_database
-from app.repositories.database import get_session_factory
-from app.core.config import get_settings
-from app.services.auth_service import AuthService, AuthenticatedUser
-from app.core.logging_config import setup_logging, get_logger
-from app.core.exceptions import (
-    IndustrialRAGException,
-    VectorStoreException,
-    EmbeddingException,
-    RetrievalException,
-    LLMException,
-    ValidationException
-)
+"""FastAPI application for the controlled design-review workspace."""
 
-# Initialize logging
-setup_logging(log_level=os.getenv("LOG_LEVEL", "INFO"))
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, status
+from fastapi.responses import JSONResponse
+
+from app.api.auth import router as auth_router
+from app.api.reviews import router as design_review_router
+from app.core.config import get_settings
+from app.core.exceptions import IndustrialRAGException
+from app.core.logging_config import get_logger, setup_logging
+from app.repositories.database import get_session_factory, initialise_database
+from app.services.auth_service import AuthService
+
+setup_logging()
 logger = get_logger(__name__)
 
-# Session storage (in production, use Redis or database)
-chat_sessions = {}
-
-
-def get_chat_response(*args, **kwargs):
-    """Load the legacy OpenAI/Supabase proof-of-concept only when chat is used."""
-    from app.services.chat_engine import get_chat_response as legacy_get_chat_response
-    return legacy_get_chat_response(*args, **kwargs)
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifecycle management for the FastAPI application."""
+async def lifespan(_: FastAPI):
     logger.info("Starting Industrial RAG Assistant API")
-
     initialise_database()
     db = get_session_factory()()
     try:
         AuthService(db, get_settings()).bootstrap_admin()
     finally:
         db.close()
-
     logger.info("Application startup complete")
-
     yield
-
     logger.info("Shutting down Industrial RAG Assistant API")
-    chat_sessions.clear()
 
-# Initialize FastAPI app
+
 app = FastAPI(
     title="Warehouse Automation Design Decision Assistant",
-    description="An intelligent RAG-based API for warehouse automation design decisions and industrial documentation queries.",
+    description="A controlled, evidence-grounded workspace for warehouse design review.",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 app.include_router(design_review_router)
 app.include_router(auth_router)
 
-# Global exception handlers
+
 @app.exception_handler(IndustrialRAGException)
-async def industrial_rag_exception_handler(request, exc: IndustrialRAGException):
-    logger.error(f"Industrial RAG error: {exc.message}", extra={"details": exc.details})
+async def industrial_rag_exception_handler(_, exc: IndustrialRAGException):
+    logger.error("Industrial RAG error: %s", exc.message, extra={"details": exc.details})
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=ErrorResponse(
-            error=exc.__class__.__name__,
-            message=exc.message,
-            details=exc.details
-        ).model_dump()
+        content={"error": exc.__class__.__name__, "message": exc.message, "details": exc.details},
     )
 
+
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc: Exception):
-    logger.error(f"Unexpected error: {str(exc)}", exc_info=True)
+async def general_exception_handler(_, exc: Exception):
+    logger.error("Unexpected error: %s", exc, exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=ErrorResponse(
-            error="InternalServerError",
-            message="An unexpected error occurred. Please try again later.",
-            details={"error_type": exc.__class__.__name__}
-        ).model_dump()
+        content={
+            "error": "InternalServerError",
+            "message": "An unexpected error occurred. Please try again later.",
+            "details": {"error_type": exc.__class__.__name__},
+        },
     )
+
 
 @app.get("/")
 async def health_check():
-    """Health check endpoint to verify the server is running."""
     return {
         "status": "ok",
         "message": "Warehouse Automation Design Decision Assistant is online",
-        "version": "2.0.0"
+        "version": "2.0.0",
     }
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(
-    request: ChatRequest,
-    _user: AuthenticatedUser = Depends(require_authenticated_user),
-):
-    """
-    Main chat endpoint for warehouse automation design queries.
-
-    Receives a question, retrieves relevant context from the vector database,
-    and returns an AI-generated answer with metadata.
-
-    Args:
-        request: ChatRequest containing the user's question and optional session_id
-
-    Returns:
-        ChatResponse with the answer, sources, and evaluation metrics
-
-    Raises:
-        HTTPException: For validation errors or processing failures
-    """
-    try:
-        # Validate input
-        if not request.question or len(request.question.strip()) == 0:
-            logger.warning("Empty question received")
-            raise ValidationException("Question cannot be empty")
-
-        if len(request.question) > 1000:
-            logger.warning(f"Question too long: {len(request.question)} chars")
-            raise ValidationException("Question exceeds maximum length of 1000 characters")
-
-        # Get or create session
-        session_id = request.session_id or "default"
-        if session_id not in chat_sessions:
-            chat_sessions[session_id] = {"history": []}
-
-        # Get chat response with session context
-        response = get_chat_response(
-            question=request.question,
-            session_id=session_id,
-            # Pass a snapshot so downstream processing cannot observe later
-            # mutations when this request is persisted in the session history.
-            chat_history=list(chat_sessions[session_id]["history"])
-        )
-
-        # Store in session history
-        chat_sessions[session_id]["history"].append({
-            "question": request.question,
-            "answer": response["answer"]
-        })
-
-        # Keep only last 10 exchanges to prevent memory bloat
-        if len(chat_sessions[session_id]["history"]) > 10:
-            chat_sessions[session_id]["history"] = chat_sessions[session_id]["history"][-10:]
-
-        logger.info(f"Chat completed - session={session_id}, sources={len(response.get('sources', []))}")
-
-        return ChatResponse(
-            answer=response["answer"],
-            sources=response.get("sources", []),
-            confidence_score=response.get("confidence_score"),
-            retrieved_chunks=response.get("retrieved_chunks", 0),
-            web_search_used=response.get("web_search_used", False),
-            web_searches_remaining=response.get("web_searches_remaining", 5)
-        )
-
-    except ValidationException as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e.message)
-
-    except IndustrialRAGException as e:
-        logger.error(f"RAG error: {e.message}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{e.__class__.__name__}: {e.message}"
-        )
-
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while processing your request"
-        )
-
-@app.get("/sessions/{session_id}/history")
-async def get_session_history(session_id: str):
-    """
-    Retrieve chat history for a specific session.
-
-    Args:
-        session_id: The session identifier
-
-    Returns:
-        List of previous questions and answers
-    """
-    if session_id not in chat_sessions:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-
-    return {
-        "session_id": session_id,
-        "history": chat_sessions[session_id]["history"]
-    }
-
-
-@app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
-    """
-    Delete a chat session and its history.
-
-    Args:
-        session_id: The session identifier to delete
-
-    Returns:
-        Confirmation message
-    """
-    if session_id in chat_sessions:
-        del chat_sessions[session_id]
-        return {"message": f"Session {session_id} deleted successfully"}
-    else:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-    

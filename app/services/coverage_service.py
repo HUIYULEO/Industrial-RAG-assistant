@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from time import sleep
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -49,14 +49,12 @@ class FindingJudge(Protocol):
     def judge(self, *, requirement_code: str, requirement_text: str, evidence: list[EvidenceChunk]) -> CandidateJudgment: ...
 
 
-class OpenAIDesignFindingJudge:
-    """Grounded English judgment adapter; never issues an approval decision."""
+class ConfiguredDesignFindingJudge:
+    """Grounded judgment adapter; never issues an approval decision."""
 
-    def __init__(self, model: str):
-        from langchain_openai import ChatOpenAI
-
-        self._llm = ChatOpenAI(model=model, temperature=0).with_structured_output(CandidateJudgment)
-        self._audit_planner = ChatOpenAI(model=model, temperature=0).with_structured_output(AuditPlan)
+    def __init__(self, model: Any):
+        self._llm = model.with_structured_output(CandidateJudgment)
+        self._audit_planner = model.with_structured_output(AuditPlan)
 
     def decompose(self, *, requirement_code: str, requirement_text: str) -> list[AuditPoint]:
         """Generate a small set of checkable points without rewriting the URS."""

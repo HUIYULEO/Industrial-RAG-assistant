@@ -17,7 +17,13 @@ DbSession = Annotated[Session, Depends(get_db)]
 
 
 def user_response(user: AuthenticatedUser) -> AuthUserResponse:
-    return AuthUserResponse(email=user.email, display_name=user.display_name, role=user.role)
+    return AuthUserResponse(
+        id=user.id,
+        organization_id=user.organization_id,
+        email=user.email,
+        display_name=user.display_name,
+        role=user.role,
+    )
 
 
 def require_authenticated_user(
@@ -40,6 +46,7 @@ def auth_config():
         authentication_required=settings.auth_required,
         self_registration_enabled=settings.allow_self_registration,
         visual_analysis_enabled=settings.enable_visual_analysis,
+        departments=list(AuthService.DEPARTMENTS),
     )
 
 
@@ -50,11 +57,13 @@ def register(payload: RegisterRequest, db: DbSession):
             display_name=payload.display_name,
             email=payload.email,
             password=payload.password,
+            department=payload.department,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        status_code = status.HTTP_400_BAD_REQUEST if "department" in str(exc).lower() else status.HTTP_409_CONFLICT
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     return user_response(user)
 
 

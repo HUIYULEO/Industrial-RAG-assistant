@@ -10,15 +10,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import jwt
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.domain.models import User
+from app.domain.models import Organization, ReviewPackage, User
 
 
 @dataclass(frozen=True)
 class AuthenticatedUser:
+    id: str
+    organization_id: str
     email: str
     display_name: str
     role: str
@@ -43,37 +45,122 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 class AuthService:
+    DEPARTMENTS = ("DDIT", "QA")
+
     def __init__(self, db: Session, settings: Settings):
         self.db = db
         self.settings = settings
 
     def bootstrap_admin(self) -> None:
-        """Optionally create a configured local administrator for controlled deployments."""
-        if not self.settings.auth_required or not self.settings.local_admin_email:
+        """Create fixed department tenants and backfill the pre-department workspace."""
+        departments = self._ensure_departments()
+        ddit = departments["DDIT"]
+        legacy_organization = self.db.scalar(select(Organization).where(Organization.name == "Local Workspace"))
+        if legacy_organization:
+            self.db.execute(
+                update(User)
+                .where(User.organization_id == legacy_organization.id)
+                .values(organization_id=ddit.id)
+            )
+            self.db.execute(
+                update(ReviewPackage)
+                .where(ReviewPackage.organization_id == legacy_organization.id)
+                .values(organization_id=ddit.id)
+            )
+        self.db.execute(
+            update(User)
+            .where(User.organization_id.is_(None))
+            .values(organization_id=ddit.id)
+        )
+        self.db.execute(
+            update(ReviewPackage)
+            .where(ReviewPackage.organization_id.is_(None))
+            .values(organization_id=ddit.id)
+        )
+        legacy_owner = self.db.scalar(
+            select(User).where(User.organization_id == ddit.id).order_by(User.created_at, User.id)
+        )
+        if legacy_owner:
+            self.db.execute(
+                update(ReviewPackage)
+                .where(ReviewPackage.owner_user_id.is_(None))
+                .values(owner_user_id=legacy_owner.id, organization_id=ddit.id)
+            )
+
+        if self.settings.auth_required:
+            self._bootstrap_configured_admin(
+                self.settings.local_admin_email,
+                self.settings.local_admin_password,
+                self.settings.local_admin_department,
+                "LOCAL_ADMIN",
+            )
+            self._bootstrap_configured_admin(
+                self.settings.ddit_admin_email,
+                self.settings.ddit_admin_password,
+                "DDIT",
+                "DDIT_ADMIN",
+            )
+            self._bootstrap_configured_admin(
+                self.settings.qa_admin_email,
+                self.settings.qa_admin_password,
+                "QA",
+                "QA_ADMIN",
+            )
+        self.db.commit()
+
+    def _ensure_departments(self) -> dict[str, Organization]:
+        departments: dict[str, Organization] = {}
+        for name in self.DEPARTMENTS:
+            organization = self.db.scalar(select(Organization).where(Organization.name == name))
+            if organization is None:
+                organization = Organization(name=name)
+                self.db.add(organization)
+                self.db.flush()
+            departments[name] = organization
+        return departments
+
+    def _department_organization(self, department: str) -> Organization:
+        requested = department.strip().upper()
+        if requested not in self.DEPARTMENTS:
+            raise ValueError("Department must be DDIT or QA")
+        return self._ensure_departments()[requested]
+
+    def _bootstrap_configured_admin(
+        self,
+        email_value: str | None,
+        password: str | None,
+        department: str,
+        setting_name: str,
+    ) -> None:
+        if not email_value:
             return
-        if not self.settings.local_admin_password:
-            raise RuntimeError("LOCAL_ADMIN_PASSWORD is required when LOCAL_ADMIN_EMAIL is configured")
-        email = self.settings.local_admin_email.strip().lower()
+        if not password:
+            raise RuntimeError(f"{setting_name}_PASSWORD is required when {setting_name}_EMAIL is configured")
+        email = email_value.strip().lower()
+        organization = self._department_organization(department)
         existing = self.db.scalar(select(User).where(User.email == email))
         if existing:
+            existing.organization_id = organization.id
+            existing.role = "admin"
             return
         self.db.add(
             User(
+                organization_id=organization.id,
                 email=email,
                 display_name=email.split("@", 1)[0].replace(".", " ").title(),
-                password_hash=hash_password(self.settings.local_admin_password),
+                password_hash=hash_password(password),
                 role="admin",
             )
         )
-        self.db.commit()
 
-    def register(self, display_name: str, email: str, password: str) -> AuthenticatedUser:
+    def register(self, display_name: str, email: str, password: str, department: str) -> AuthenticatedUser:
         if not self.settings.allow_self_registration:
             raise PermissionError("Account registration is disabled")
         normalised_email = email.strip().lower()
         if self.db.scalar(select(User).where(User.email == normalised_email)):
             raise ValueError("An account with this email already exists")
         user = User(
+            organization_id=self._department_organization(department).id,
             email=normalised_email,
             display_name=display_name.strip(),
             password_hash=hash_password(password),
@@ -81,7 +168,7 @@ class AuthService:
         )
         self.db.add(user)
         self.db.commit()
-        return AuthenticatedUser(email=user.email, display_name=user.display_name, role=user.role)
+        return self._identity(user)
 
     def login(self, email: str, password: str) -> tuple[str, AuthenticatedUser]:
         if not self.settings.auth_required:
@@ -91,10 +178,11 @@ class AuthService:
             raise PermissionError("Invalid email or password")
         if not self.settings.auth_secret:
             raise RuntimeError("AUTH_SECRET is not configured")
-        identity = AuthenticatedUser(email=user.email, display_name=user.display_name, role=user.role)
+        identity = self._identity(user)
         token = jwt.encode(
             {
                 "sub": user.id,
+                "organization_id": identity.organization_id,
                 "email": identity.email,
                 "display_name": identity.display_name,
                 "role": identity.role,
@@ -116,4 +204,16 @@ class AuthService:
         user = self.db.get(User, user_id)
         if user is None or not user.is_active:
             raise PermissionError("Account is unavailable")
-        return AuthenticatedUser(email=user.email, display_name=user.display_name, role=user.role)
+        return self._identity(user)
+
+    @staticmethod
+    def _identity(user: User) -> AuthenticatedUser:
+        if not user.organization_id:
+            raise PermissionError("Account is not assigned to an organization")
+        return AuthenticatedUser(
+            id=user.id,
+            organization_id=user.organization_id,
+            email=user.email,
+            display_name=user.display_name,
+            role=user.role,
+        )

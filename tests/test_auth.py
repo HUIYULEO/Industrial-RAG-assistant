@@ -38,12 +38,17 @@ def test_protected_workspace_requires_token_and_accepts_bootstrap_admin(protecte
 
 
 def test_user_can_register_and_sign_in_with_email_and_password(protected_client: TestClient):
+    config = protected_client.get("/auth/config")
+    assert config.status_code == 200
+    assert config.json()["departments"] == ["DDIT", "QA"]
+
     created = protected_client.post(
         "/auth/register",
         json={
             "display_name": "Avery Chen",
             "email": "avery.chen@example.com",
             "password": "a-strong-local-password",
+            "department": "QA",
         },
     )
     assert created.status_code == 201
@@ -56,6 +61,7 @@ def test_user_can_register_and_sign_in_with_email_and_password(protected_client:
             "display_name": "Avery Chen",
             "email": "avery.chen@example.com",
             "password": "a-strong-local-password",
+            "department": "QA",
         },
     )
     assert duplicate.status_code == 409
@@ -66,3 +72,17 @@ def test_user_can_register_and_sign_in_with_email_and_password(protected_client:
     )
     assert login.status_code == 200
     assert login.json()["user"]["email"] == "avery.chen@example.com"
+
+
+def test_registration_rejects_unknown_department(protected_client: TestClient):
+    response = protected_client.post(
+        "/auth/register",
+        json={
+            "display_name": "Jordan Lee",
+            "email": "jordan.lee@example.com",
+            "password": "a-strong-local-password",
+            "department": "Engineering",
+        },
+    )
+    assert response.status_code == 400
+    assert "DDIT or QA" in response.json()["detail"]

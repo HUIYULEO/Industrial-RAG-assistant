@@ -17,18 +17,35 @@ class Base(DeclarativeBase):
     pass
 
 
+class Organization(Base):
+    """Tenant boundary for users and their private review workspaces."""
+
+    __tablename__ = "organizations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    users: Mapped[list[User]] = relationship(back_populates="organization")
+    review_packages: Mapped[list[ReviewPackage]] = relationship(back_populates="organization")
+
+
 class User(Base):
     """Local identity record; production deployments may replace it with corporate SSO."""
 
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(200), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
     role: Mapped[str] = mapped_column(String(40), nullable=False, default="engineer")
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    organization: Mapped[Organization] = relationship(back_populates="users")
+    review_packages: Mapped[list[ReviewPackage]] = relationship(back_populates="owner")
 
 
 class Document(Base):
@@ -156,12 +173,17 @@ class ReviewPackage(Base):
     __tablename__ = "review_packages"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(300), unique=True, nullable=False)
     system: Mapped[str] = mapped_column(String(150), nullable=False)
     requirement_baseline_id: Mapped[str] = mapped_column(
         ForeignKey("requirement_baselines.id"), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    owner: Mapped[User] = relationship(back_populates="review_packages")
+    organization: Mapped[Organization] = relationship(back_populates="review_packages")
 
     document_links: Mapped[list[ReviewPackageDocument]] = relationship(
         back_populates="review_package", cascade="all, delete-orphan"

@@ -41,7 +41,7 @@ function AuthGate({ onAuthenticated }: { onAuthenticated: (token: string, user: 
       } else {
         const password = String(form.get("password") ?? "");
         if (password !== String(form.get("confirmPassword") ?? "")) throw new Error("Passwords do not match.");
-        const user = await api<User>("/auth/register", json({ display_name: form.get("displayName"), email: form.get("email"), password }));
+        const user = await api<User>("/auth/register", json({ display_name: form.get("displayName"), email: form.get("email"), password, department: form.get("department") }));
         const result = await api<{ access_token: string; user: User }>("/auth/login", json({ email: user.email, password }));
         onAuthenticated(result.access_token, result.user);
       }
@@ -55,6 +55,7 @@ function AuthGate({ onAuthenticated }: { onAuthenticated: (token: string, user: 
       {error && <Notice kind="error">{error}</Notice>}
       <form onSubmit={submit} className="stack">
         {mode === "register" && <label>Display name<input name="displayName" required minLength={2} autoComplete="name" /></label>}
+        {mode === "register" && <label>Department<select name="department" required defaultValue=""><option value="" disabled>Select department</option>{config?.departments.map((department) => <option key={department} value={department}>{department}</option>)}</select></label>}
         <label>Work email<input name="email" type="email" required autoComplete="email" /></label>
         <label>Password<input name="password" type="password" required minLength={12} autoComplete={mode === "login" ? "current-password" : "new-password"} /></label>
         {mode === "register" && <label>Confirm password<input name="confirmPassword" type="password" required minLength={12} autoComplete="new-password" /></label>}
@@ -98,6 +99,13 @@ function LiveRun({ token, runId, onSettled }: { token: string; runId: string; on
 
 function Review({ token, reviews, activeReviewId, onRunCreated }: { token: string; reviews: ReviewPackage[]; activeReviewId: string | null; onRunCreated: (id: string) => void }) {
   const [runId, setRunId] = useState<string | null>(null); const [rows, setRows] = useState<MatrixRow[]>([]); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const active = reviews.find((review) => review.id === activeReviewId);
+  useEffect(() => {
+    setRunId(null); setRows([]); setError(null);
+    if (!active) return;
+    api<{ id: string }[]>(`/review-packages/${active.id}/analyses`, {}, token)
+      .then((runs) => setRunId(runs[0]?.id ?? null))
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "Previous review runs are unavailable."));
+  }, [active?.id, token]);
   async function start() { if (!active) return; setBusy(true); setError(null); try { const run = await api<{ id: string }>(`/review-packages/${active.id}/analyses`, { method: "POST" }, token); setRunId(run.id); setRows([]); onRunCreated(run.id); } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to queue the review."); } finally { setBusy(false); } }
   async function loadMatrix() { if (!runId) return; try { setRows(await api<MatrixRow[]>(`/analysis-runs/${runId}/matrix`, {}, token)); } catch (reason) { setError(reason instanceof Error ? reason.message : "Traceability matrix is unavailable."); } }
   async function exportMatrix() { if (!runId) return; try { const response = await fetch(`/api/backend/analysis-runs/${runId}/export.xlsx`, { headers: { Authorization: `Bearer ${token}` } }); if (!response.ok) throw new Error("Export failed."); const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = "urs-traceability-matrix.xlsx"; link.click(); URL.revokeObjectURL(url); } catch (reason) { setError(reason instanceof Error ? reason.message : "Matrix export failed."); } }

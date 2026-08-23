@@ -87,6 +87,8 @@ class ReviewPackageCreate(BaseModel):
 
 class ReviewPackageResponse(BaseModel):
     id: str
+    owner_user_id: str
+    organization_id: str
     name: str
     system: str
     requirement_baseline_id: str
@@ -228,9 +230,12 @@ class RegisterRequest(BaseModel):
     display_name: str = Field(min_length=2, max_length=200)
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=12, max_length=512)
+    department: str = Field(min_length=2, max_length=50)
 
 
 class AuthUserResponse(BaseModel):
+    id: str
+    organization_id: str
     email: str
     display_name: str
     role: str
@@ -240,6 +245,7 @@ class AuthConfigResponse(BaseModel):
     authentication_required: bool
     self_registration_enabled: bool
     visual_analysis_enabled: bool
+    departments: list[str]
 
 
 class LoginResponse(BaseModel):

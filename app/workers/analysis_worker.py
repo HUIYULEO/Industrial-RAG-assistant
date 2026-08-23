@@ -5,8 +5,9 @@ from __future__ import annotations
 from app.core.config import get_settings
 from app.repositories.database import get_session_factory, initialise_database
 from app.repositories.milvus_repository import MilvusChunkRepository
-from app.services.coverage_service import CoverageAnalysisService, OpenAIDesignFindingJudge
-from app.services.embedding_service import OpenAIEmbeddingService
+from app.services.coverage_service import ConfiguredDesignFindingJudge, CoverageAnalysisService
+from app.services.embedding_service import ConfiguredEmbeddingService
+from app.services.model_provider import create_chat_model
 from app.services.retrieval_service import MilvusRetrievalService
 
 
@@ -22,12 +23,12 @@ def execute_analysis_item(analysis_run_item_id: str) -> None:
                 collection_name=settings.milvus_collection,
                 dimension=settings.embedding_dimensions,
             ),
-            embeddings=OpenAIEmbeddingService(settings.embedding_model, settings.embedding_dimensions),
+            embeddings=ConfiguredEmbeddingService(settings),
         )
         CoverageAnalysisService(
             db,
             retrieval=retrieval,
-            judge=OpenAIDesignFindingJudge(settings.chat_model),
+            judge=ConfiguredDesignFindingJudge(create_chat_model(settings)),
         ).execute_item(
             analysis_run_item_id,
             max_attempts=settings.analysis_item_max_attempts,

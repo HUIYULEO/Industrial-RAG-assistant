@@ -6,7 +6,7 @@ import base64
 import hashlib
 import re
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
@@ -37,13 +37,11 @@ class VisualInterpreter(Protocol):
     def analyse(self, *, image_path: Path, page: int, section: str | None) -> VisualAnalysis: ...
 
 
-class OpenAIVisualInterpreter:
+class ConfiguredVisualInterpreter:
     """Vision-model adapter kept behind a small protocol for deterministic tests."""
 
-    def __init__(self, model: str):
-        from langchain_openai import ChatOpenAI
-
-        self._llm = ChatOpenAI(model=model, temperature=0).with_structured_output(VisualAnalysis)
+    def __init__(self, model: Any):
+        self._llm = model.with_structured_output(VisualAnalysis)
 
     def analyse(self, *, image_path: Path, page: int, section: str | None) -> VisualAnalysis:
         image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")

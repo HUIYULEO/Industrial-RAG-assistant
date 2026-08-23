@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
+from app.core.glossary import terminology_context
 from app.domain.evidence import EvidenceChunk, RetrievalFilters
 from app.services.retrieval_service import RetrievalService
 
@@ -28,27 +29,31 @@ class AnswerGenerator(Protocol):
     def generate(self, *, question: str, evidence: list[EvidenceChunk]) -> GroundedAnswer: ...
 
 
-class OpenAIQueryNormalizer:
-    def __init__(self, model: str):
-        from langchain_openai import ChatOpenAI
+class ConfiguredQueryNormalizer:
+    """Query normalizer backed by the chat provider selected at runtime."""
 
-        self._llm = ChatOpenAI(model=model, temperature=0).with_structured_output(NormalizedQuery)
+    def __init__(self, model: Any):
+        self._llm = model.with_structured_output(NormalizedQuery)
 
     def normalize(self, question: str) -> NormalizedQuery:
+        glossary_context = terminology_context(question)
         return self._llm.invoke(
             "Translate the user's question into a concise English technical retrieval query. "
             "Preserve identifiers, acronyms, vendor terms, and constraints exactly where possible. "
+            "Use the terminology guidance only to understand or translate terms; do not add facts not in the question. "
+            f"{glossary_context}\n\n"
             f"User question:\n{question}"
         )
 
 
-class OpenAIGroundedAnswerGenerator:
-    def __init__(self, model: str):
-        from langchain_openai import ChatOpenAI
+class ConfiguredGroundedAnswerGenerator:
+    """Grounded answer generator backed by the selected chat provider."""
 
-        self._llm = ChatOpenAI(model=model, temperature=0).with_structured_output(GroundedAnswer)
+    def __init__(self, model: Any):
+        self._llm = model.with_structured_output(GroundedAnswer)
 
     def generate(self, *, question: str, evidence: list[EvidenceChunk]) -> GroundedAnswer:
+        glossary_context = terminology_context(question)
         context = "\n\n".join(
             f"[chunk_id={item.chunk_id}]\n"
             f"{item.document_title} v{item.version} | {item.document_type} | "
@@ -62,6 +67,9 @@ Answer in English even if the user asked in another language. Use only the suppl
 Never state that a document, design, or supplier is approved, compliant, or verified.
 If the evidence is insufficient, explicitly say so and describe the limitation.
 Select only chunk IDs shown below that support your answer.
+Use terminology guidance only for wording; never treat it as supplier-document evidence.
+
+{glossary_context}
 
 Question:
 {question}

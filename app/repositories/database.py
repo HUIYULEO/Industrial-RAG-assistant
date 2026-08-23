@@ -53,6 +53,13 @@ def initialise_database() -> None:
         "review_findings": {
             "audit_points": "JSON",
         },
+        "users": {
+            "organization_id": "VARCHAR(36)",
+        },
+        "review_packages": {
+            "owner_user_id": "VARCHAR(36)",
+            "organization_id": "VARCHAR(36)",
+        },
     }
     inspector = inspect(engine)
     with engine.begin() as connection:

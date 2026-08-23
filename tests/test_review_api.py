@@ -31,7 +31,11 @@ def review_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     database.initialise_database()
     from app.main import app
     app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedUser(
-        email="test.engineer@example.com", display_name="Test Engineer", role="engineer"
+        id="engineer-1",
+        organization_id="organization-1",
+        email="test.engineer@example.com",
+        display_name="Test Engineer",
+        role="engineer",
     )
     with TestClient(app) as client:
         yield client
@@ -97,6 +101,41 @@ def test_import_requirements_and_create_review_package(review_client: TestClient
     analysis = review_client.post(f"/review-packages/{review.json()['id']}/analyses")
     assert analysis.status_code == 202
     assert analysis.json()["status"] == "queued"
+
+    resumed_runs = review_client.get(f"/review-packages/{review.json()['id']}/analyses")
+    assert resumed_runs.status_code == 200
+    assert [run["id"] for run in resumed_runs.json()] == [analysis.json()["id"]]
+
+
+def test_review_packages_are_private_to_the_owner_within_an_organization(review_client: TestClient):
+    baseline = review_client.post(
+        "/requirement-baselines", json={"name": "Private URS", "system": "fleet_manager_wcs"}
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={"file": ("urs.csv", b"requirement_code,requirement_text\nURS-001,Private requirement\n", "text/csv")},
+    )
+    package = review_client.post(
+        "/review-packages",
+        json={
+            "name": "Private review",
+            "system": "fleet_manager_wcs",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [create_design_document(review_client)],
+        },
+    ).json()
+
+    from app.main import app
+
+    app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedUser(
+        id="engineer-2",
+        organization_id="organization-1",
+        email="other.engineer@example.com",
+        display_name="Other Engineer",
+        role="engineer",
+    )
+    assert review_client.get("/review-packages").json() == []
+    assert review_client.get(f"/review-packages/{package['id']}").status_code == 404
 
 
 def test_import_urs_table_creates_traceable_baseline_without_manual_setup(review_client: TestClient):

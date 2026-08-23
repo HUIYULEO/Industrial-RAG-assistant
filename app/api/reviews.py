@@ -37,24 +37,27 @@ from app.domain.enums import coverage_status_definition
 from app.repositories.database import get_db, get_session_factory
 from app.core.config import get_settings
 from app.services.ingestion_service import DocumentIngestionService
-from app.services.embedding_service import OpenAIEmbeddingService
+from app.services.embedding_service import ConfiguredEmbeddingService
 from app.services.indexing_service import DocumentIndexingService
 from app.repositories.milvus_repository import MilvusChunkRepository
 from app.services.retrieval_service import MilvusRetrievalService
-from app.services.design_review_chat_service import (
-    DesignReviewChatService,
-    OpenAIGroundedAnswerGenerator,
-    OpenAIQueryNormalizer,
-)
+from app.services.design_review_chat_service import ConfiguredGroundedAnswerGenerator, ConfiguredQueryNormalizer, DesignReviewChatService
 from app.services.review_service import ReviewService
-from app.services.visual_evidence_service import OpenAIVisualInterpreter, VisualEvidenceService
+from app.services.visual_evidence_service import ConfiguredVisualInterpreter, VisualEvidenceService
 from app.services.analysis_queue import AnalysisQueue, AnalysisQueueUnavailable, get_analysis_queue
 from app.services.matrix_export_service import MatrixExportService
+from app.services.model_provider import create_chat_model
 from app.api.auth import require_authenticated_user
+from app.services.auth_service import AuthenticatedUser
 
 router = APIRouter(tags=["design-review"], dependencies=[Depends(require_authenticated_user)])
 DbSession = Annotated[Session, Depends(get_db)]
 AnalysisQueueDependency = Annotated[AnalysisQueue, Depends(get_analysis_queue)]
+CurrentUser = Annotated[AuthenticatedUser, Depends(require_authenticated_user)]
+
+
+def scoped_review_service(db: Session, user: AuthenticatedUser) -> ReviewService:
+    return ReviewService(db, owner_user_id=user.id, organization_id=user.organization_id)
 
 
 def document_response(item: DocumentVersion) -> DocumentVersionResponse:
@@ -123,6 +126,8 @@ def figure_response(item: DocumentFigure) -> DocumentFigureResponse:
 def review_response(item: ReviewPackage) -> ReviewPackageResponse:
     return ReviewPackageResponse(
         id=item.id,
+        owner_user_id=item.owner_user_id,
+        organization_id=item.organization_id,
         name=item.name,
         system=item.system,
         requirement_baseline_id=item.requirement_baseline_id,
@@ -362,7 +367,7 @@ def analyse_document_figures(document_version_id: str, db: DbSession):
     try:
         figures = VisualEvidenceService(db, settings.data_dir).analyse_figures(
             document_version_id,
-            OpenAIVisualInterpreter(settings.chat_model),
+            ConfiguredVisualInterpreter(create_chat_model(settings)),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -380,7 +385,7 @@ def index_document(document_version_id: str, db: DbSession):
     try:
         item = DocumentIndexingService(
             db,
-            OpenAIEmbeddingService(settings.embedding_model, settings.embedding_dimensions),
+            ConfiguredEmbeddingService(settings),
             MilvusChunkRepository(
                 uri=settings.milvus_uri,
                 collection_name=settings.milvus_collection,
@@ -474,10 +479,11 @@ def list_requirements(baseline_id: str, db: DbSession):
 
 
 @router.post("/review-packages", response_model=ReviewPackageResponse, status_code=status.HTTP_201_CREATED)
-def create_review_package(payload: ReviewPackageCreate, db: DbSession):
+def create_review_package(payload: ReviewPackageCreate, db: DbSession, user: CurrentUser):
+    service = scoped_review_service(db, user)
     try:
-        item = ReviewService(db).create_review_package(**payload.model_dump())
-        item = ReviewService(db).get_review_package(item.id)
+        item = service.create_review_package(**payload.model_dump())
+        item = service.get_review_package(item.id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -489,17 +495,17 @@ def create_review_package(payload: ReviewPackageCreate, db: DbSession):
 
 
 @router.get("/review-packages/{review_id}", response_model=ReviewPackageResponse)
-def get_review_package(review_id: str, db: DbSession):
+def get_review_package(review_id: str, db: DbSession, user: CurrentUser):
     try:
-        item = ReviewService(db).get_review_package(review_id)
+        item = scoped_review_service(db, user).get_review_package(review_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return review_response(item)
 
 
 @router.get("/review-packages", response_model=list[ReviewPackageResponse])
-def list_review_packages(db: DbSession):
-    return [review_response(item) for item in ReviewService(db).list_review_packages()]
+def list_review_packages(db: DbSession, user: CurrentUser):
+    return [review_response(item) for item in scoped_review_service(db, user).list_review_packages()]
 
 
 @router.post(
@@ -507,9 +513,9 @@ def list_review_packages(db: DbSession):
     response_model=AnalysisRunResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def create_analysis_run(review_id: str, db: DbSession, queue: AnalysisQueueDependency):
+def create_analysis_run(review_id: str, db: DbSession, queue: AnalysisQueueDependency, user: CurrentUser):
     """Create one durable item per URS entry and dispatch them to Redis/RQ."""
-    service = ReviewService(db)
+    service = scoped_review_service(db, user)
     try:
         item = service.create_analysis_run(review_id)
         item = enqueue_analysis_items(service, service.get_analysis_run(item.id), queue)
@@ -526,19 +532,28 @@ def create_analysis_run(review_id: str, db: DbSession, queue: AnalysisQueueDepen
     return analysis_run_response(item)
 
 
-@router.get("/analysis-runs/{analysis_run_id}", response_model=AnalysisRunResponse)
-def get_analysis_run(analysis_run_id: str, db: DbSession):
+@router.get("/review-packages/{review_id}/analyses", response_model=list[AnalysisRunResponse])
+def list_analysis_runs(review_id: str, db: DbSession, user: CurrentUser):
+    """List previous durable URS reviews so work can resume after a later sign-in."""
     try:
-        item = ReviewService(db).get_analysis_run(analysis_run_id)
+        return [analysis_run_response(item) for item in scoped_review_service(db, user).list_analysis_runs(review_id)]
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/analysis-runs/{analysis_run_id}", response_model=AnalysisRunResponse)
+def get_analysis_run(analysis_run_id: str, db: DbSession, user: CurrentUser):
+    try:
+        item = scoped_review_service(db, user).get_analysis_run(analysis_run_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return analysis_run_response(item)
 
 
 @router.post("/analysis-runs/{analysis_run_id}/execute", response_model=AnalysisRunResponse)
-def execute_analysis_run(analysis_run_id: str, db: DbSession, queue: AnalysisQueueDependency):
+def execute_analysis_run(analysis_run_id: str, db: DbSession, queue: AnalysisQueueDependency, user: CurrentUser):
     """Compatibility endpoint: enqueue any un-dispatched queued items."""
-    service = ReviewService(db)
+    service = scoped_review_service(db, user)
     try:
         item = service.get_analysis_run(analysis_run_id)
         if item.status == "completed":
@@ -554,9 +569,9 @@ def execute_analysis_run(analysis_run_id: str, db: DbSession, queue: AnalysisQue
 
 
 @router.post("/analysis-runs/{analysis_run_id}/retry", response_model=AnalysisRunResponse, status_code=status.HTTP_202_ACCEPTED)
-def retry_failed_analysis_items(analysis_run_id: str, db: DbSession, queue: AnalysisQueueDependency):
+def retry_failed_analysis_items(analysis_run_id: str, db: DbSession, queue: AnalysisQueueDependency, user: CurrentUser):
     """Requeue only terminally failed URS items; completed evidence remains intact."""
-    service = ReviewService(db)
+    service = scoped_review_service(db, user)
     try:
         service.retry_failed_analysis_items(analysis_run_id)
         item = enqueue_analysis_items(service, service.get_analysis_run(analysis_run_id), queue)
@@ -571,18 +586,18 @@ def retry_failed_analysis_items(analysis_run_id: str, db: DbSession, queue: Anal
 
 
 @router.get("/analysis-runs/{analysis_run_id}/progress", response_model=AnalysisRunProgressResponse)
-def get_analysis_run_progress(analysis_run_id: str, db: DbSession):
+def get_analysis_run_progress(analysis_run_id: str, db: DbSession, user: CurrentUser):
     try:
-        return analysis_progress_response(ReviewService(db).get_analysis_run(analysis_run_id))
+        return analysis_progress_response(scoped_review_service(db, user).get_analysis_run(analysis_run_id))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/analysis-runs/{analysis_run_id}/events")
-async def stream_analysis_run_progress(analysis_run_id: str, request: Request, db: DbSession):
+async def stream_analysis_run_progress(analysis_run_id: str, request: Request, db: DbSession, user: CurrentUser):
     """Send durable progress snapshots as SSE; clients may reconnect safely."""
     try:
-        analysis_progress_response(ReviewService(db).get_analysis_run(analysis_run_id))
+        analysis_progress_response(scoped_review_service(db, user).get_analysis_run(analysis_run_id))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -592,7 +607,9 @@ async def stream_analysis_run_progress(analysis_run_id: str, request: Request, d
         while not await request.is_disconnected():
             session = get_session_factory()()
             try:
-                progress = analysis_progress_response(ReviewService(session).get_analysis_run(analysis_run_id))
+                progress = analysis_progress_response(
+                    scoped_review_service(session, user).get_analysis_run(analysis_run_id)
+                )
                 payload = progress.model_dump_json()
             finally:
                 session.close()
@@ -613,18 +630,18 @@ async def stream_analysis_run_progress(analysis_run_id: str, request: Request, d
 
 
 @router.get("/analysis-runs/{analysis_run_id}/findings", response_model=list[FindingResponse])
-def list_findings(analysis_run_id: str, db: DbSession):
+def list_findings(analysis_run_id: str, db: DbSession, user: CurrentUser):
     try:
-        findings = ReviewService(db).list_findings(analysis_run_id)
+        findings = scoped_review_service(db, user).list_findings(analysis_run_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return [finding_response(item) for item in findings]
 
 
 @router.get("/analysis-runs/{analysis_run_id}/matrix", response_model=list[MatrixRowResponse])
-def get_traceability_matrix(analysis_run_id: str, db: DbSession):
+def get_traceability_matrix(analysis_run_id: str, db: DbSession, user: CurrentUser):
     """Return a complete traceability matrix, including worker failures and pending rows."""
-    service = ReviewService(db)
+    service = scoped_review_service(db, user)
     try:
         run = service.get_analysis_run(analysis_run_id)
         findings = service.list_findings(analysis_run_id)
@@ -638,9 +655,9 @@ def get_traceability_matrix(analysis_run_id: str, db: DbSession):
 
 
 @router.get("/analysis-runs/{analysis_run_id}/export.xlsx")
-def export_traceability_matrix(analysis_run_id: str, db: DbSession):
+def export_traceability_matrix(analysis_run_id: str, db: DbSession, user: CurrentUser):
     """Export the complete matrix with immutable review scope metadata."""
-    service = ReviewService(db)
+    service = scoped_review_service(db, user)
     try:
         run = service.get_analysis_run(analysis_run_id)
         review = service.get_review_package(run.review_package_id)
@@ -672,12 +689,13 @@ def export_traceability_matrix(analysis_run_id: str, db: DbSession):
 
 
 @router.post("/design-review/chat", response_model=ReviewChatResponse)
-def design_review_chat(payload: ReviewChatRequest, db: DbSession):
+def design_review_chat(payload: ReviewChatRequest, db: DbSession, user: CurrentUser):
     """Ask Chinese or English questions against only one frozen review scope."""
     settings = get_settings()
     try:
-        review = ReviewService(db).get_review_package(payload.review_package_id)
-        embeddings = OpenAIEmbeddingService(settings.embedding_model, settings.embedding_dimensions)
+        review = scoped_review_service(db, user).get_review_package(payload.review_package_id)
+        embeddings = ConfiguredEmbeddingService(settings)
+        chat_model = create_chat_model(settings)
         answer, citations, retrieval_query = DesignReviewChatService(
             retrieval=MilvusRetrievalService(
                 repository=MilvusChunkRepository(
@@ -687,8 +705,8 @@ def design_review_chat(payload: ReviewChatRequest, db: DbSession):
                 ),
                 embeddings=embeddings,
             ),
-            normalizer=OpenAIQueryNormalizer(settings.chat_model),
-            generator=OpenAIGroundedAnswerGenerator(settings.chat_model),
+            normalizer=ConfiguredQueryNormalizer(chat_model),
+            generator=ConfiguredGroundedAnswerGenerator(chat_model),
         ).answer(
             question=payload.question,
             document_version_ids=[link.document_version_id for link in review.document_links],

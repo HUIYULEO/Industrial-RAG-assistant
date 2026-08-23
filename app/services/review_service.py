@@ -46,8 +46,21 @@ class ReviewService:
         "category": ("category", "类别", "分类"),
     }
 
-    def __init__(self, db: Session):
+    def __init__(
+        self,
+        db: Session,
+        *,
+        owner_user_id: str | None = None,
+        organization_id: str | None = None,
+    ):
         self.db = db
+        self.owner_user_id = owner_user_id
+        self.organization_id = organization_id
+
+    def _require_review_scope(self) -> tuple[str, str]:
+        if not self.owner_user_id or not self.organization_id:
+            raise PermissionError("A user and organization are required for review workspace access")
+        return self.owner_user_id, self.organization_id
 
     def create_document(
         self,
@@ -324,7 +337,10 @@ class ReviewService:
         if invalid:
             raise ValueError("Review packages currently accept only FS and DS document versions")
 
+        owner_user_id, organization_id = self._require_review_scope()
         review = ReviewPackage(
+            owner_user_id=owner_user_id,
+            organization_id=organization_id,
             name=name,
             system=system,
             requirement_baseline_id=requirement_baseline_id,
@@ -351,13 +367,18 @@ class ReviewService:
         return review
 
     def get_review_package(self, review_id: str) -> ReviewPackage:
+        owner_user_id, organization_id = self._require_review_scope()
         statement = (
             select(ReviewPackage)
             .options(
                 selectinload(ReviewPackage.document_links),
                 selectinload(ReviewPackage.requirement_snapshots),
             )
-            .where(ReviewPackage.id == review_id)
+            .where(
+                ReviewPackage.id == review_id,
+                ReviewPackage.owner_user_id == owner_user_id,
+                ReviewPackage.organization_id == organization_id,
+            )
         )
         review = self.db.scalar(statement)
         if review is None:
@@ -365,9 +386,13 @@ class ReviewService:
         return review
 
     def list_review_packages(self) -> list[ReviewPackage]:
+        owner_user_id, organization_id = self._require_review_scope()
         statement = select(ReviewPackage).options(
             selectinload(ReviewPackage.document_links),
             selectinload(ReviewPackage.requirement_snapshots),
+        ).where(
+            ReviewPackage.owner_user_id == owner_user_id,
+            ReviewPackage.organization_id == organization_id,
         ).order_by(ReviewPackage.created_at.desc())
         return list(self.db.scalars(statement))
 
@@ -385,11 +410,28 @@ class ReviewService:
         self.db.refresh(run)
         return run
 
+    def list_analysis_runs(self, review_id: str) -> list[AnalysisRun]:
+        """Return durable audit runs for a Review Package, newest first."""
+        self.get_review_package(review_id)
+        return list(
+            self.db.scalars(
+                select(AnalysisRun)
+                .where(AnalysisRun.review_package_id == review_id)
+                .order_by(AnalysisRun.created_at.desc(), AnalysisRun.id.desc())
+            )
+        )
+
     def get_analysis_run(self, run_id: str) -> AnalysisRun:
+        owner_user_id, organization_id = self._require_review_scope()
         run = self.db.scalar(
             select(AnalysisRun)
             .options(selectinload(AnalysisRun.items).selectinload(AnalysisRunItem.requirement_snapshot))
-            .where(AnalysisRun.id == run_id)
+            .join(ReviewPackage, AnalysisRun.review_package_id == ReviewPackage.id)
+            .where(
+                AnalysisRun.id == run_id,
+                ReviewPackage.owner_user_id == owner_user_id,
+                ReviewPackage.organization_id == organization_id,
+            )
         )
         if run is None:
             raise LookupError("Analysis run not found")
@@ -432,8 +474,7 @@ class ReviewService:
         return failed
 
     def list_findings(self, run_id: str) -> list[ReviewFinding]:
-        if self.db.get(AnalysisRun, run_id) is None:
-            raise LookupError("Analysis run not found")
+        self.get_analysis_run(run_id)
         return list(
             self.db.scalars(
                 select(ReviewFinding)
