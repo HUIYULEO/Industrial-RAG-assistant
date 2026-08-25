@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.domain.enums import DocumentStatus, DocumentType
+from app.domain.enums import DESIGN_DOCUMENT_TYPES, DocumentStatus, DocumentType
 from app.domain.models import (
     Document,
     DocumentVersion,
@@ -118,6 +119,33 @@ class ReviewService:
             DocumentVersion.created_at.desc()
         )
         return list(self.db.scalars(statement))
+
+    def archive_document_version(
+        self, *, document_version_id: str, reason: str, archived_by_user_id: str
+    ) -> DocumentVersion:
+        version = self.db.scalar(
+            select(DocumentVersion)
+            .options(selectinload(DocumentVersion.document))
+            .where(DocumentVersion.id == document_version_id)
+        )
+        if version is None:
+            raise LookupError("Document version not found")
+        if version.status == DocumentStatus.ARCHIVED.value:
+            return version
+        if self.db.scalar(
+            select(ReviewPackageDocument.id).where(
+                ReviewPackageDocument.document_version_id == document_version_id
+            )
+        ):
+            raise ValueError("A document version in a frozen Review Package cannot be archived")
+
+        version.status = DocumentStatus.ARCHIVED.value
+        version.archived_at = datetime.now(timezone.utc)
+        version.archived_by_user_id = archived_by_user_id
+        version.archived_reason = reason.strip()
+        self.db.commit()
+        self.db.refresh(version)
+        return version
 
     def create_baseline(self, *, name: str, system: str, description: str | None) -> RequirementBaseline:
         baseline = RequirementBaseline(name=name, system=system, description=description)
@@ -322,7 +350,7 @@ class ReviewService:
         if not requirements:
             raise ValueError("A review package requires at least one imported requirement")
         if not design_document_version_ids:
-            raise ValueError("At least one supplier FS or DS version is required")
+            raise ValueError("At least one Functional, Software Design, or Hardware Design Specification is required")
 
         versions = list(
             self.db.scalars(
@@ -333,9 +361,12 @@ class ReviewService:
         )
         if len(versions) != len(set(design_document_version_ids)):
             raise LookupError("One or more document versions were not found")
-        invalid = [item.id for item in versions if item.document.document_type not in {"FS", "DS"}]
+        invalid = [item.id for item in versions if item.document.document_type not in DESIGN_DOCUMENT_TYPES]
         if invalid:
-            raise ValueError("Review packages currently accept only FS and DS document versions")
+            raise ValueError("Review packages accept only Functional, Software Design, or Hardware Design Specifications")
+        archived = [item.id for item in versions if item.status == DocumentStatus.ARCHIVED.value]
+        if archived:
+            raise ValueError("Archived document versions cannot be added to a new Review Package")
 
         owner_user_id, organization_id = self._require_review_scope()
         review = ReviewPackage(
@@ -435,7 +466,32 @@ class ReviewService:
         )
         if run is None:
             raise LookupError("Analysis run not found")
+        self._reconcile_analysis_run_status(run)
         return run
+
+    def _reconcile_analysis_run_status(self, run: AnalysisRun) -> None:
+        """Repair a stale run summary from its durable item states.
+
+        Workers commit their items independently.  A restart between the item
+        commit and the run-summary commit must not leave the workboard running
+        forever after every item has settled.
+        """
+        statuses = [item.status for item in run.items]
+        if any(status in {"queued", "running", "retrying"} for status in statuses):
+            return
+        if any(status == "failed" for status in statuses):
+            failed_count = sum(status == "failed" for status in statuses)
+            next_status = "failed"
+            next_error = f"{failed_count} analysis item(s) failed; retry failed items to continue."
+        else:
+            next_status = "completed"
+            next_error = None
+        if run.status == next_status and run.error_message == next_error and run.completed_at is not None:
+            return
+        run.status = next_status
+        run.error_message = next_error
+        run.completed_at = datetime.now(timezone.utc)
+        self.db.commit()
 
     def set_analysis_item_job_ids(self, run_id: str, job_ids: dict[str, str]) -> AnalysisRun:
         run = self.get_analysis_run(run_id)

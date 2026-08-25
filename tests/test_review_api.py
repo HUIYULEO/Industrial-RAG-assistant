@@ -10,6 +10,7 @@ from pypdf import PdfWriter
 
 from app.domain.evidence import EvidenceChunk
 from app.domain.enums import CoverageStatus
+from app.domain.models import AnalysisRun
 from app.api.auth import require_authenticated_user
 from app.repositories import database
 from app.services.auth_service import AuthenticatedUser
@@ -61,6 +62,77 @@ def create_design_document(client: TestClient, *, document_type: str = "FS", ver
     return response.json()["id"]
 
 
+def test_document_archive_preserves_auditable_record(review_client: TestClient):
+    version_id = create_design_document(review_client)
+
+    response = review_client.post(
+        f"/documents/{version_id}/archive",
+        json={"reason": "The source file exceeded the permitted upload size."},
+    )
+
+    assert response.status_code == 200
+    archived = response.json()
+    assert archived["status"] == "archived"
+    assert archived["archived_reason"] == "The source file exceeded the permitted upload size."
+    assert archived["archived_by_user_id"] == "engineer-1"
+    assert archived["archived_at"] is not None
+    assert any(item["id"] == version_id and item["status"] == "archived" for item in review_client.get("/documents").json())
+
+
+def test_document_in_frozen_review_package_cannot_be_archived(review_client: TestClient):
+    baseline = review_client.post(
+        "/requirement-baselines", json={"name": "Archive guard URS", "system": "fleet_manager"}
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={"file": ("urs.csv", b"requirement_code,requirement_text\nURS-001,Record retention\n", "text/csv")},
+    )
+    version_id = create_design_document(review_client)
+    review_client.post(
+        "/review-packages",
+        json={
+            "name": "Archive guard review",
+            "system": "fleet_manager",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [version_id],
+        },
+    )
+
+    response = review_client.post(
+        f"/documents/{version_id}/archive", json={"reason": "Attempted archive after the scope was frozen."}
+    )
+
+    assert response.status_code == 400
+    assert "frozen Review Package" in response.json()["detail"]
+
+
+def test_archived_document_cannot_be_added_to_a_new_review_package(review_client: TestClient):
+    baseline = review_client.post(
+        "/requirement-baselines", json={"name": "Archived source URS", "system": "fleet_manager"}
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={"file": ("urs.csv", b"requirement_code,requirement_text\nURS-001,Record retention\n", "text/csv")},
+    )
+    version_id = create_design_document(review_client)
+    review_client.post(
+        f"/documents/{version_id}/archive", json={"reason": "Superseded before the review package was created."}
+    )
+
+    response = review_client.post(
+        "/review-packages",
+        json={
+            "name": "Archived source review",
+            "system": "fleet_manager",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [version_id],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Archived document versions" in response.json()["detail"]
+
+
 def test_import_requirements_and_create_review_package(review_client: TestClient):
     baseline = review_client.post(
         "/requirement-baselines",
@@ -105,6 +177,41 @@ def test_import_requirements_and_create_review_package(review_client: TestClient
     resumed_runs = review_client.get(f"/review-packages/{review.json()['id']}/analyses")
     assert resumed_runs.status_code == 200
     assert [run["id"] for run in resumed_runs.json()] == [analysis.json()["id"]]
+
+
+def test_progress_reconciles_a_stale_run_after_all_items_settle(review_client: TestClient):
+    baseline = review_client.post(
+        "/requirement-baselines", json={"name": "Reconciled status URS", "system": "fleet_manager"}
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={"file": ("urs.csv", b"requirement_code,requirement_text\nURS-001,Record retention\n", "text/csv")},
+    )
+    review = review_client.post(
+        "/review-packages",
+        json={
+            "name": "Reconciled status review",
+            "system": "fleet_manager",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [create_design_document(review_client)],
+        },
+    ).json()
+    run = review_client.post(f"/review-packages/{review['id']}/analyses").json()
+
+    db = database.get_session_factory()()
+    persisted = db.get(AnalysisRun, run["id"])
+    assert persisted is not None
+    for item in persisted.items:
+        item.status = "completed"
+    persisted.status = "running"
+    persisted.completed_at = None
+    db.commit()
+    db.close()
+
+    progress = review_client.get(f"/analysis-runs/{run['id']}/progress").json()
+
+    assert progress["status"] == "completed"
+    assert progress["completed_items"] == 1
 
 
 def test_review_packages_are_private_to_the_owner_within_an_organization(review_client: TestClient):
@@ -200,7 +307,40 @@ def test_review_package_rejects_non_design_document(review_client: TestClient):
         },
     )
     assert response.status_code == 400
-    assert "FS and DS" in response.json()["detail"]
+    assert "Functional, Software Design, or Hardware Design" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("document_type", ["FS", "SDS", "HDS"])
+def test_review_package_accepts_supported_design_specification_types(
+    review_client: TestClient, document_type: str
+):
+    baseline = review_client.post(
+        "/requirement-baselines",
+        json={"name": f"{document_type} acceptance URS", "system": "fleet_manager"},
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={
+            "file": (
+                "urs.csv",
+                b"requirement_code,requirement_text\nURS-001,The system shall retain task status history.\n",
+                "text/csv",
+            )
+        },
+    )
+    version_id = create_design_document(review_client, document_type=document_type)
+
+    response = review_client.post(
+        "/review-packages",
+        json={
+            "name": f"DR-{document_type}-accepted",
+            "system": "fleet_manager_wcs",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [version_id],
+        },
+    )
+
+    assert response.status_code == 201
 
 
 def test_document_replacement_preserves_logical_document(review_client: TestClient):
@@ -240,6 +380,42 @@ def test_pdf_upload_rejects_non_extractable_document(review_client: TestClient, 
     )
     assert response.status_code == 400
     assert "No extractable text" in response.json()["detail"]
+
+
+def test_encrypted_pdf_requires_and_accepts_a_one_time_password(review_client: TestClient):
+    import fitz
+    from pypdf import PdfReader
+
+    source = fitz.open()
+    page = source.new_page()
+    page.insert_text((72, 72), "4.1 Task dispatch\nThe system retains task dispatch records for audit.")
+    readable_pdf = source.tobytes()
+    source.close()
+
+    writer = PdfWriter()
+    reader = PdfReader(BytesIO(readable_pdf))
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt("supplier-password", algorithm="AES-256")
+    encrypted_pdf = BytesIO()
+    writer.write(encrypted_pdf)
+
+    missing_password_version = create_design_document(review_client)
+    missing_password = review_client.post(
+        f"/documents/{missing_password_version}/upload",
+        files={"file": ("protected.pdf", encrypted_pdf.getvalue(), "application/pdf")},
+    )
+    assert missing_password.status_code == 400
+    assert "Enter its password" in missing_password.json()["detail"]
+
+    password_version = create_design_document(review_client)
+    accepted = review_client.post(
+        f"/documents/{password_version}/upload",
+        files={"file": ("protected.pdf", encrypted_pdf.getvalue(), "application/pdf")},
+        data={"pdf_password": "supplier-password"},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["ingestion_status"] == "parsed_pending_index"
 
 
 def test_pdf_visual_evidence_is_rendered_before_explicit_analysis(
@@ -350,6 +526,33 @@ def test_csv_upload_preserves_rows_as_citable_chunks(review_client: TestClient):
     assert len(chunks) == 2
     assert chunks[0]["section"] == "CSV row 1"
     assert "owner: Automation" in chunks[0]["content"]
+
+
+def test_stored_document_can_be_reparsed_with_the_current_chunk_configuration(review_client: TestClient):
+    import fitz
+
+    source = fitz.open()
+    page = source.new_page()
+    source_text = "4.1 Task dispatch\n" + ("The system shall retain task dispatch records for audit. " * 12)
+    page.insert_textbox((72, 72, 500, 700), source_text)
+    content = source.tobytes()
+    source.close()
+
+    version_id = create_design_document(review_client)
+    uploaded = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("fleet_manager.pdf", content, "application/pdf")},
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["chunk_count"] == 1
+
+    reparsed = review_client.post(f"/documents/{version_id}/reparse")
+
+    assert reparsed.status_code == 200
+    assert reparsed.json()["ingestion_status"] == "parsed_pending_index"
+    assert reparsed.json()["chunk_count"] == 1
+    chunks = review_client.get(f"/documents/{version_id}/chunks").json()
+    assert all(chunk["page"] == 1 for chunk in chunks)
 
 
 def test_document_upload_rejects_unsupported_source(review_client: TestClient):

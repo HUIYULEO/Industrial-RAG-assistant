@@ -25,7 +25,7 @@ class MatrixExportService:
         "Assessment Status",
         "Status Definition",
         "Processing Status",
-        "FS/DS Citations (document, version, section, page, excerpt)",
+        "Design-Specification Citations (document, version, section, page, excerpt)",
         "LLM Mapping Rationale",
         "Potential Gap",
         "Suggested Reviewer Action",

@@ -82,6 +82,9 @@ class DocumentVersion(Base):
     supersedes_version_id: Mapped[str | None] = mapped_column(
         ForeignKey("document_versions.id"), nullable=True
     )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by_user_id: Mapped[str | None] = mapped_column(String(36))
+    archived_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     document: Mapped[Document] = relationship(back_populates="versions", foreign_keys=[document_id])

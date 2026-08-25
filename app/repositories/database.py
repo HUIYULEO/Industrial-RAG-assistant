@@ -50,6 +50,11 @@ def initialise_database() -> None:
             "candidate_relationships": "JSON",
             "citation_chunk_id": "VARCHAR(36)",
         },
+        "document_versions": {
+            "archived_at": "TIMESTAMP WITH TIME ZONE",
+            "archived_by_user_id": "VARCHAR(36)",
+            "archived_reason": "TEXT",
+        },
         "review_findings": {
             "audit_points": "JSON",
         },

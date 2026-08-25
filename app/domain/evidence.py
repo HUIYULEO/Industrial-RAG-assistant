@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 
+from app.domain.enums import DESIGN_DOCUMENT_TYPES
+
 
 @dataclass(frozen=True)
 class RetrievalFilters:
@@ -9,7 +11,7 @@ class RetrievalFilters:
 
     document_version_ids: list[str]
     system: str | None = None
-    document_types: list[str] = field(default_factory=lambda: ["FS", "DS"])
+    document_types: list[str] = field(default_factory=lambda: sorted(DESIGN_DOCUMENT_TYPES))
 
 
 @dataclass(frozen=True)

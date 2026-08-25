@@ -1,4 +1,4 @@
-"""Evidence-first URS/ES-to-FS/DS candidate finding generation."""
+"""Evidence-first URS/ES-to-design-specification candidate finding generation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.domain.evidence import EvidenceChunk, RetrievalFilters
-from app.domain.enums import CoverageStatus
+from app.domain.enums import DESIGN_DOCUMENT_TYPES, CoverageStatus
 from app.domain.models import AnalysisRun, AnalysisRunItem, FindingEvidence, ReviewFinding, ReviewPackage
 from app.services.retrieval_service import RetrievalService
 
@@ -58,13 +58,13 @@ class ConfiguredDesignFindingJudge:
 
     def decompose(self, *, requirement_code: str, requirement_text: str) -> list[AuditPoint]:
         """Generate a small set of checkable points without rewriting the URS."""
-        prompt = f"""You are preparing an advisory FS/DS coverage review for an engineer.
+        prompt = f"""You are preparing an advisory design-specification coverage review for an engineer.
 
 Original URS: {requirement_code}
 {requirement_text}
 
 Return one to six audit points. Each point must be a concrete condition that can
-be checked against FS/DS evidence. Keep the original URS unchanged: for every
+be checked against design-specification evidence. Keep the original URS unchanged: for every
 point, include the exact supporting phrase from it in source_excerpt. Do not
 invent conditions, standards, or implementation details. Use one point when
 the URS is already atomic. Return English only."""
@@ -95,7 +95,7 @@ You are not an approver and you must not make a compliance decision.
 Requirement: {requirement_code}
 {requirement_text}
 
-Review only the supplied FS/DS evidence. Return an English candidate finding.
+Review only the supplied design-specification evidence. Return an English candidate finding.
 - covered: evidence explicitly addresses the requirement and key conditions.
 - partially_covered: relevant capability is described but an important condition, failure mode, limit, or configuration detail is absent.
 - not_evidenced: selected evidence does not establish a response.
@@ -218,7 +218,7 @@ class CoverageAnalysisService:
         filters = RetrievalFilters(
             document_version_ids=[link.document_version_id for link in review.document_links],
             system=review.system,
-            document_types=["FS", "DS"],
+            document_types=sorted(DESIGN_DOCUMENT_TYPES),
         )
         audit_points = self._audit_points(requirement.requirement_code, requirement.requirement_text)
         evidence = self._retrieve_audit_evidence(requirement.requirement_code, audit_points, filters)
@@ -277,7 +277,7 @@ class CoverageAnalysisService:
             return CandidateJudgment(
                 design_status=CoverageStatus.NOT_EVIDENCED,
                 rationale="No explicit evidence was found in the selected review scope.",
-                suggested_reviewer_action="Review the selected FS/DS manually or request a vendor design response.",
+                suggested_reviewer_action="Review the selected design specifications manually or request a vendor design response.",
                 audit_points=[
                     AuditPointJudgment(
                         **point.model_dump(),
@@ -329,7 +329,7 @@ class CoverageAnalysisService:
                 update={
                     "design_status": CoverageStatus.REVIEW_REQUIRED,
                     "rationale": "Not every checkable condition has sufficient cited evidence; engineering review is required.",
-                    "suggested_reviewer_action": "Review the audit points and their cited FS/DS passages manually.",
+                    "suggested_reviewer_action": "Review the audit points and their cited design-specification passages manually.",
                 }
             )
         if judgment.design_status == CoverageStatus.NOT_EVIDENCED:

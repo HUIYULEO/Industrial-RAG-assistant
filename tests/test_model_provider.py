@@ -24,6 +24,14 @@ def test_resolves_deepseek_connection_from_dedicated_configuration():
     assert connection.api_key == "deepseek-test-key"
 
 
+def test_blank_openai_base_url_uses_the_public_api_endpoint():
+    settings = Settings(openai_api_key="openai-test-key", openai_base_url="")
+
+    connection = resolve_provider(settings, "openai")
+
+    assert connection.base_url == "https://api.openai.com/v1"
+
+
 def test_deepseek_cannot_be_selected_for_embeddings():
     settings = Settings(embedding_provider="deepseek", deepseek_api_key="deepseek-test-key")
 

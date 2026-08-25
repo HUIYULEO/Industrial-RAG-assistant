@@ -21,6 +21,12 @@ from app.services.visual_evidence_service import VisualEvidenceService
 
 _HEADING_PATTERN = re.compile(r"^(?:\d+(?:\.\d+){0,5}\s+.+|[A-Z][A-Z\s/&-]{5,})$")
 
+# Change these code-level defaults when the corpus requires a different
+# character-based segmentation strategy.  Existing documents must be reparsed
+# and re-indexed for a change to take effect.
+DEFAULT_CHUNK_SIZE = 2_200
+DEFAULT_CHUNK_OVERLAP = 300
+
 
 @dataclass(frozen=True)
 class ParsedChunk:
@@ -32,7 +38,17 @@ class ParsedChunk:
 class DocumentIngestionService:
     """Preserve document provenance before any vector/LLM processing occurs."""
 
-    def __init__(self, db: Session, data_dir: Path, chunk_size: int = 1400, chunk_overlap: int = 180):
+    def __init__(
+        self,
+        db: Session,
+        data_dir: Path,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    ):
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be at least 1")
+        if not 0 <= chunk_overlap < chunk_size:
+            raise ValueError("chunk_overlap must be at least 0 and smaller than chunk_size")
         self.db = db
         self.data_dir = data_dir
         self.chunk_size = chunk_size
@@ -40,7 +56,14 @@ class DocumentIngestionService:
 
     supported_extensions = {".pdf", ".docx", ".csv"}
 
-    def upload_and_parse(self, document_version_id: str, filename: str, content: bytes) -> DocumentVersion:
+    def upload_and_parse(
+        self,
+        document_version_id: str,
+        filename: str,
+        content: bytes,
+        *,
+        pdf_password: str | None = None,
+    ) -> DocumentVersion:
         version = self.db.get(DocumentVersion, document_version_id)
         if version is None:
             raise LookupError("Document version not found")
@@ -64,7 +87,7 @@ class DocumentIngestionService:
         self.db.commit()
 
         try:
-            parsed_chunks, source_units = self._parse_source(target_path, suffix)
+            parsed_chunks, source_units = self._parse_source(target_path, suffix, pdf_password=pdf_password)
             self.db.execute(delete(DocumentChunk).where(DocumentChunk.document_version_id == version.id))
             for index, chunk in enumerate(parsed_chunks):
                 self.db.add(
@@ -86,7 +109,60 @@ class DocumentIngestionService:
             if suffix == ".pdf":
                 # Candidate pages are rendered locally but are not sent to an LLM
                 # or indexed until an engineer explicitly requests analysis.
-                VisualEvidenceService(self.db, self.data_dir).extract_pdf_candidates(version.id, target_path)
+                VisualEvidenceService(self.db, self.data_dir).extract_pdf_candidates(
+                    version.id, target_path, pdf_password=pdf_password
+                )
+        except Exception as exc:
+            version.ingestion_status = "failed"
+            version.ingestion_error = str(exc)
+            self.db.commit()
+            raise ValueError(f"{suffix[1:].upper()} parsing failed: {exc}") from exc
+
+        self.db.refresh(version)
+        return version
+
+    def reparse_stored_document(
+        self, document_version_id: str, *, pdf_password: str | None = None
+    ) -> DocumentVersion:
+        """Rebuild citable chunks from the original locally stored source file."""
+        version = self.db.get(DocumentVersion, document_version_id)
+        if version is None:
+            raise LookupError("Document version not found")
+        if not version.storage_path:
+            raise ValueError("The original uploaded file is unavailable; upload the document again to parse it")
+
+        source_path = Path(version.storage_path)
+        if not source_path.is_file():
+            raise ValueError("The original uploaded file is unavailable; upload the document again to parse it")
+        suffix = source_path.suffix.lower()
+        if suffix not in self.supported_extensions:
+            raise ValueError("Stored source format is no longer supported")
+
+        version.ingestion_status = "parsing"
+        version.ingestion_error = None
+        self.db.commit()
+        try:
+            parsed_chunks, source_units = self._parse_source(source_path, suffix, pdf_password=pdf_password)
+            self.db.execute(delete(DocumentChunk).where(DocumentChunk.document_version_id == version.id))
+            for index, chunk in enumerate(parsed_chunks):
+                self.db.add(
+                    DocumentChunk(
+                        document_version_id=version.id,
+                        chunk_index=index,
+                        page=chunk.page,
+                        section=chunk.section,
+                        content=chunk.content,
+                        content_hash=hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
+                    )
+                )
+            version.page_count = source_units
+            version.chunk_count = len(parsed_chunks)
+            version.ingestion_status = "parsed_pending_index"
+            self.db.commit()
+            if suffix == ".pdf":
+                VisualEvidenceService(self.db, self.data_dir).extract_pdf_candidates(
+                    version.id, source_path, pdf_password=pdf_password
+                )
         except Exception as exc:
             version.ingestion_status = "failed"
             version.ingestion_error = str(exc)
@@ -107,17 +183,20 @@ class DocumentIngestionService:
             )
         )
 
-    def _parse_source(self, path: Path, suffix: str) -> tuple[list[ParsedChunk], int]:
+    def _parse_source(self, path: Path, suffix: str, *, pdf_password: str | None = None) -> tuple[list[ParsedChunk], int]:
         if suffix == ".pdf":
-            return self._parse_pdf(path)
+            return self._parse_pdf(path, pdf_password=pdf_password)
         if suffix == ".docx":
             return self._parse_docx(path)
         return self._parse_csv(path)
 
-    def _parse_pdf(self, path: Path) -> tuple[list[ParsedChunk], int]:
+    def _parse_pdf(self, path: Path, *, pdf_password: str | None = None) -> tuple[list[ParsedChunk], int]:
         reader = PdfReader(str(path))
         if reader.is_encrypted:
-            raise ValueError("Encrypted PDFs are not supported")
+            if not reader.decrypt(pdf_password or ""):
+                if pdf_password:
+                    raise ValueError("The PDF password is incorrect or cannot open this encrypted PDF")
+                raise ValueError("This PDF is encrypted. Enter its password to parse it; the password is not stored")
         if not reader.pages:
             raise ValueError("PDF contains no pages")
 

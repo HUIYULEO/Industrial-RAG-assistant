@@ -6,11 +6,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.schemas import (
     DocumentCreate,
+    DocumentArchiveRequest,
     DocumentVersionResponse,
     RequirementBaselineCreate,
     RequirementBaselineImportResponse,
@@ -32,7 +34,16 @@ from app.api.schemas import (
     ReviewPackageCreate,
     ReviewPackageResponse,
 )
-from app.domain.models import AnalysisRun, DocumentFigure, DocumentVersion, Requirement, RequirementBaseline, ReviewFinding, ReviewPackage
+from app.domain.models import (
+    AnalysisRun,
+    DocumentFigure,
+    DocumentVersion,
+    Requirement,
+    RequirementBaseline,
+    ReviewFinding,
+    ReviewPackage,
+    ReviewPackageDocument,
+)
 from app.domain.enums import coverage_status_definition
 from app.repositories.database import get_db, get_session_factory
 from app.core.config import get_settings
@@ -78,6 +89,9 @@ def document_response(item: DocumentVersion) -> DocumentVersionResponse:
         page_count=item.page_count,
         chunk_count=item.chunk_count,
         supersedes_version_id=item.supersedes_version_id,
+        archived_at=item.archived_at,
+        archived_by_user_id=item.archived_by_user_id,
+        archived_reason=item.archived_reason,
         created_at=item.created_at,
     )
 
@@ -295,8 +309,33 @@ def list_documents(db: DbSession):
     return [document_response(item) for item in ReviewService(db).list_document_versions()]
 
 
+@router.post("/documents/{document_version_id}/archive", response_model=DocumentVersionResponse)
+def archive_document(
+    document_version_id: str,
+    payload: DocumentArchiveRequest,
+    db: DbSession,
+    user: CurrentUser,
+):
+    try:
+        item = ReviewService(db).archive_document_version(
+            document_version_id=document_version_id,
+            reason=payload.reason,
+            archived_by_user_id=user.id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return document_response(item)
+
+
 @router.post("/documents/{document_version_id}/upload", response_model=DocumentVersionResponse)
-async def upload_document(document_version_id: str, db: DbSession, file: UploadFile = File(...)):
+async def upload_document(
+    document_version_id: str,
+    db: DbSession,
+    file: UploadFile = File(...),
+    pdf_password: str | None = Form(default=None),
+):
     """Store and parse a PDF, DOCX, or CSV source before separate vector indexing."""
     settings = get_settings()
     content = await file.read()
@@ -304,7 +343,32 @@ async def upload_document(document_version_id: str, db: DbSession, file: UploadF
         raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_size_mb} MB limit")
     try:
         item = DocumentIngestionService(db, settings.data_dir).upload_and_parse(
-            document_version_id, file.filename or "", content
+            document_version_id, file.filename or "", content, pdf_password=pdf_password
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return document_response(item)
+
+
+@router.post("/documents/{document_version_id}/reparse", response_model=DocumentVersionResponse)
+def reparse_document(
+    document_version_id: str,
+    db: DbSession,
+    pdf_password: str | None = Form(default=None),
+):
+    """Regenerate chunks from the stored source; call /index afterwards to rebuild vectors."""
+    settings = get_settings()
+    try:
+        if db.scalar(
+            select(ReviewPackageDocument.id).where(
+                ReviewPackageDocument.document_version_id == document_version_id
+            )
+        ):
+            raise ValueError("A document version in a frozen Review Package cannot be reparsed")
+        item = DocumentIngestionService(db, settings.data_dir).reparse_stored_document(
+            document_version_id, pdf_password=pdf_password
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -391,6 +455,10 @@ def index_document(document_version_id: str, db: DbSession):
                 collection_name=settings.milvus_collection,
                 dimension=settings.embedding_dimensions,
             ),
+            batch_token_budget=settings.embedding_batch_token_budget,
+            tokens_per_minute=settings.embedding_tokens_per_minute,
+            max_retries=settings.embedding_batch_max_retries,
+            retry_base_delay_seconds=settings.embedding_retry_base_delay_seconds,
         ).index_document_version(document_version_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -711,6 +779,7 @@ def design_review_chat(payload: ReviewChatRequest, db: DbSession, user: CurrentU
             question=payload.question,
             document_version_ids=[link.document_version_id for link in review.document_links],
             system=review.system,
+            conversation_history=[(message.role, message.content) for message in payload.conversation_history],
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

@@ -68,7 +68,9 @@ class VisualEvidenceService:
         self.data_dir = data_dir
         self.max_pages = max_pages
 
-    def extract_pdf_candidates(self, document_version_id: str, source_path: Path) -> list[DocumentFigure]:
+    def extract_pdf_candidates(
+        self, document_version_id: str, source_path: Path, *, pdf_password: str | None = None
+    ) -> list[DocumentFigure]:
         """Render likely diagram pages without calling an LLM or changing the retrieval index."""
         try:
             import fitz
@@ -95,6 +97,11 @@ class VisualEvidenceService:
         figure_dir.mkdir(parents=True, exist_ok=True)
 
         with fitz.open(source_path) as document:
+            if document.needs_pass:
+                if not document.authenticate(pdf_password or ""):
+                    if pdf_password:
+                        raise ValueError("The PDF password is incorrect or cannot render this encrypted PDF")
+                    raise ValueError("This PDF is encrypted. Enter its password to render it")
             for page_index, page in enumerate(document, start=1):
                 if len(figures) >= self.max_pages:
                     break

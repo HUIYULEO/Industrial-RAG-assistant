@@ -90,7 +90,13 @@ def _connection(name: str, api_key: str | None, base_url: str | None) -> Provide
         raise ModelProviderConfigurationError(
             f"{name.upper()} API key is required for the selected provider. Check the corresponding environment variable."
         )
-    return ProviderConnection(name=name, api_key=api_key.strip(), base_url=base_url.rstrip("/") if base_url else None)
+    normalised_base_url = base_url.strip().rstrip("/") if base_url and base_url.strip() else None
+    # LangChain's OpenAI client treats an explicit ``None`` base_url differently
+    # from an omitted base URL in some dependency versions.  Pin the public
+    # endpoint for direct OpenAI use so a blank OPENAI_BASE_URL= remains safe.
+    if name == "openai" and normalised_base_url is None:
+        normalised_base_url = "https://api.openai.com/v1"
+    return ProviderConnection(name=name, api_key=api_key.strip(), base_url=normalised_base_url)
 
 
 def _ensure_model_matches_provider(model: str, provider_name: str, *, capability: str) -> None:

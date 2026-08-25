@@ -2,9 +2,15 @@ export type User = { id: string; organization_id: string; email: string; display
 export type AuthConfig = { authentication_required: boolean; self_registration_enabled: boolean; visual_analysis_enabled: boolean; departments: string[] };
 export type DocumentVersion = {
   id: string; title: string; document_type: string; system: string; vendor?: string | null; version: string;
-  ingestion_status: string; ingestion_error?: string | null; chunk_count: number; page_count?: number | null;
+  status: string; ingestion_status: string; ingestion_error?: string | null; chunk_count: number; page_count?: number | null;
+  archived_at?: string | null; archived_by_user_id?: string | null; archived_reason?: string | null;
 };
 export type RequirementBaseline = { id: string; name: string; system: string; description?: string | null };
+export type Requirement = {
+  id: string; requirement_code: string; requirement_text: string; source_row?: string | null;
+  requirement_system?: string | null; rationale_impact?: string | null; is_critical: boolean;
+  priority?: string | null; category?: string | null; source_section?: string | null;
+};
 export type ReviewPackage = { id: string; owner_user_id: string; organization_id: string; name: string; system: string; requirement_count: number; design_document_version_ids: string[] };
 export type Finding = {
   id: string; requirement_code: string; requirement_text: string; design_status: string; rationale: string;

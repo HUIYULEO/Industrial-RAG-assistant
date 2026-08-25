@@ -28,7 +28,7 @@ class GlossaryTerm:
 
 
 # Start intentionally small. New terms should come from controlled URS/ES and
-# supplier FS/DS documents, then be reviewed by an engineer before being added.
+# supplier design specifications, then be reviewed by an engineer before being added.
 GLOSSARY: tuple[GlossaryTerm, ...] = (
     GlossaryTerm(
         canonical="WCS",
@@ -95,12 +95,20 @@ GLOSSARY: tuple[GlossaryTerm, ...] = (
         definition="The supplier document describing intended functional behaviour.",
     ),
     GlossaryTerm(
-        canonical="DS",
-        chinese="详细设计说明书",
-        english="Detailed Specification",
-        abbreviations=("DS",),
-        aliases=("详细设计",),
-        definition="The supplier document describing detailed technical design.",
+        canonical="SDS",
+        chinese="软件设计规格说明书",
+        english="Software Design Specification",
+        abbreviations=("SDS",),
+        aliases=("软件设计",),
+        definition="The supplier document describing software design, interfaces, configuration, and behaviour.",
+    ),
+    GlossaryTerm(
+        canonical="HDS",
+        chinese="硬件设计规格说明书",
+        english="Hardware Design Specification",
+        abbreviations=("HDS",),
+        aliases=("硬件设计",),
+        definition="The supplier document describing hardware design, interfaces, safety-related equipment, and installation constraints.",
     ),
     GlossaryTerm(
         canonical="FAT",

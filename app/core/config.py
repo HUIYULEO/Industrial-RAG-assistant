@@ -33,10 +33,19 @@ class Settings(BaseSettings):
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    # Keep local indexing below the free-tier 40k TPM limit by default.  These
+    # settings are intentionally provider-neutral; they can be tuned for a
+    # paid OpenAI tier or another OpenAI-compatible embedding provider.
+    embedding_batch_token_budget: int = 10_000
+    embedding_tokens_per_minute: int = 30_000
+    embedding_batch_max_retries: int = 4
+    embedding_retry_base_delay_seconds: float = 2.0
     chat_model: str = "gpt-4o"
     llm_timeout_seconds: int = 60
     llm_max_retries: int = 2
-    max_upload_size_mb: int = 25
+    # ABB's public AMR T702 Product Manual is about 44 MB, so permit a single
+    # conventional supplier manual in the local review workspace by default.
+    max_upload_size_mb: int = 50
     auth_required: bool = True
     # Safe only for this local Docker workspace. Set a unique secret before sharing a deployment.
     auth_secret: str = "local-development-secret-change-before-shared-deployment"

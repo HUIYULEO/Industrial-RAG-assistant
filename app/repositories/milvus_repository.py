@@ -72,6 +72,7 @@ class MilvusChunkRepository:
             ranker=RRFRanker(),
             limit=limit,
             output_fields=[
+                "chunk_id",
                 "document_version_id",
                 "document_title",
                 "document_type",
@@ -85,9 +86,14 @@ class MilvusChunkRepository:
         for hits in results:
             for hit in hits:
                 entity = hit["entity"]
+                # MilvusClient 2.6 returns the primary key under its schema
+                # field name (chunk_id), not the legacy generic "id" key.
+                chunk_id = hit.get("chunk_id") or entity.get("chunk_id")
+                if not chunk_id:
+                    raise ValueError("Milvus search result is missing the chunk_id primary key")
                 evidence.append(
                     EvidenceChunk(
-                        chunk_id=str(hit["id"]),
+                        chunk_id=str(chunk_id),
                         document_version_id=entity["document_version_id"],
                         document_title=entity["document_title"],
                         document_type=entity["document_type"],

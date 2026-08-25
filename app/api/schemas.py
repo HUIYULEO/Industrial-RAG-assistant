@@ -1,6 +1,7 @@
 """Pydantic request and response contracts for review-workspace APIs."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -20,6 +21,10 @@ class DocumentCreate(BaseModel):
     supersedes_version_id: str | None = None
 
 
+class DocumentArchiveRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
 class DocumentVersionResponse(BaseModel):
     id: str
     document_id: str
@@ -37,6 +42,9 @@ class DocumentVersionResponse(BaseModel):
     page_count: int | None
     chunk_count: int
     supersedes_version_id: str | None
+    archived_at: datetime | None
+    archived_by_user_id: str | None
+    archived_reason: str | None
     created_at: datetime | None
 
 
@@ -199,9 +207,19 @@ class MatrixRowResponse(BaseModel):
     audit_points: list[AuditPointResponse] = Field(default_factory=list)
 
 
+class ReviewChatHistoryMessage(BaseModel):
+    """Conversation context supplied by the current user's browser only."""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
 class ReviewChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     review_package_id: str
+    # The client retains more messages for display but sends only a bounded
+    # recent window to make follow-up questions understandable.
+    conversation_history: list[ReviewChatHistoryMessage] = Field(default_factory=list, max_length=12)
 
 
 class ReviewChatCitation(BaseModel):
