@@ -1,27 +1,51 @@
-# Warehouse Automation Design Review Assistant
+# Industrial AI Technical Assistant (RAG Pipeline)
 
-A local, evidence-grounded workspace for reviewing warehouse-automation supplier FS/DS documents against controlled URS/ES requirements.
+## 🚀 Project Overview
 
-The application keeps its review state in PostgreSQL:
+An AI-powered technical support agent designed to assist engineers in querying complex industrial documentation (PDFs). Built with a microservices architecture, this system ingests unstructured data, generates vector embeddings, and serves answers via a RAG (Retrieval-Augmented Generation) pipeline.
 
-- a frozen **Review Package** captures the URS/ES baseline and selected source versions;
-- each **Analysis Run** stores durable, per-requirement progress, findings, and citations;
-- reopening a Review Package resumes its most recent run, including partial and failed work.
+**Tech Stack:** Python, FastAPI, Streamlit, LangChain, PostgreSQL (pgvector), Docker.
 
-The legacy prototype, open-web search, Streamlit interface, and in-memory chat state have been removed from this branch.
+## 🏗️ Architecture
 
-## Run locally
+The system follows a containerized microservices pattern:
 
-```powershell
-Copy-Item .env.example .env
-docker compose up --build
-```
+- **Ingestion Service:** ETL pipeline that chunks PDF manuals and stores semantic embeddings in Supabase.
+- **Vector Database:** PostgreSQL with `pgvector` for cosine similarity search (1536 dimensions).
+- **Backend API:** FastAPI service handling asynchronous query processing and LLM context injection.
+- **Frontend:** Streamlit interface for real-time user interaction.
+- **Infrastructure:** Fully containerized using Docker & Docker Compose.
 
-Set `OPENAI_API_KEY` and a unique `AUTH_SECRET` in `.env`. Open the Next.js workspace at http://localhost:3000.
+## 🛠️ How to Run
 
-The available departments are fixed to `DDIT` and `QA`. Set
-`DDIT_ADMIN_EMAIL` / `DDIT_ADMIN_PASSWORD` and/or `QA_ADMIN_EMAIL` /
-`QA_ADMIN_PASSWORD` to bootstrap a department administrator; users choose their
-department during registration.
+Prerequisites: Docker Desktop & Git.
 
-For the complete workflow, architecture, and API notes, see [UPDATE_README.md](UPDATE_README.md).
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/HUIYULEO/Industrial-RAG-assistant.git
+   cd industrial-rag
+   ```
+2. **Set up Environment: Create a .env file with your credentials:**
+   ```env
+   OPENAI_API_KEY=sk-...
+   SUPABASE_URL=...
+   SUPABASE_SERVICE_KEY=...
+   ```
+3. **Deploy:**
+   ```bash
+   docker-compose up --build
+   ```
+   Access the UI at http://localhost:3000
+   
+## What I Learned
+Working on this project deepened my understanding of:
+- Vector embeddings and similarity search
+- LLM prompt engineering and context management
+- RAG architecture and retrieval optimization
+
+## V2 Roadmap
+Currently working on V2:
+- add LangGraph Agent Flow with three tools: RAG Search, Web Search, Calculator
+- Improved chunking strategies
+- Hybrid search (semantic + keyword)
+- Add RAG Evaluation Pipeline 
