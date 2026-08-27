@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from io import BytesIO
+from types import SimpleNamespace
 
 import pytest
 from docx import Document as WordDocument
@@ -12,6 +13,7 @@ from app.domain.evidence import EvidenceChunk
 from app.domain.enums import CoverageStatus
 from app.domain.models import AnalysisRun
 from app.api.auth import require_authenticated_user
+from app.bootstrap.service_factory import build_design_review_chat_service
 from app.repositories import database
 from app.services.auth_service import AuthenticatedUser
 from app.services.coverage_service import (
@@ -21,6 +23,10 @@ from app.services.coverage_service import (
     CoverageAnalysisService,
 )
 from app.services.visual_evidence_service import VisualAnalysis, VisualEvidenceService
+from app.services.design_review_chat_service import PreparedAnswer
+from app.services.analysis_queue import get_analysis_queue
+from app.services.analysis_reliability_service import AnalysisReliabilityService
+from app.core.config import get_settings
 
 
 @pytest.fixture
@@ -60,6 +66,51 @@ def create_design_document(client: TestClient, *, document_type: str = "FS", ver
     )
     assert response.status_code == 201
     return response.json()["id"]
+
+
+def test_evidence_chat_streams_tokens_then_final_citations(review_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    from app.api.routes import chat as chat_routes
+    from app.main import app
+
+    evidence = EvidenceChunk(
+        chunk_id="chunk-001",
+        document_version_id="version-1",
+        document_title="Fleet Manager FS",
+        document_type="FS",
+        version="1.0",
+        page=3,
+        section="Retention",
+        content="Task dispatch records are retained for 90 days.",
+        fused_score=0.9,
+    )
+
+    class FakeChat:
+        def prepare(self, **_):
+            return PreparedAnswer("retention period", [evidence], [])
+
+        def stream_answer(self, **_):
+            yield "Task dispatch records "
+            yield "are retained for 90 days."
+
+    class FakeReviewService:
+        def get_review_package(self, _):
+            return SimpleNamespace(system="fleet_manager", document_links=[SimpleNamespace(document_version_id="version-1")])
+
+    monkeypatch.setattr(chat_routes, "scoped_review_service", lambda *_: FakeReviewService())
+    app.dependency_overrides[build_design_review_chat_service] = lambda: FakeChat()
+    try:
+        response = review_client.post(
+            "/design-review/chat/stream",
+            json={"question": "How long are records retained?", "review_package_id": "review-1"},
+        )
+    finally:
+        app.dependency_overrides.pop(build_design_review_chat_service, None)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert 'event: token\ndata: {"text": "Task dispatch records "}' in response.text
+    assert 'event: final' in response.text
+    assert '"chunk_id": "chunk-001"' in response.text
 
 
 def test_document_archive_preserves_auditable_record(review_client: TestClient):
@@ -212,6 +263,68 @@ def test_progress_reconciles_a_stale_run_after_all_items_settle(review_client: T
 
     assert progress["status"] == "completed"
     assert progress["completed_items"] == 1
+
+
+def test_progress_requeues_items_when_their_rq_jobs_are_stale(review_client: TestClient):
+    from app.main import app
+
+    class FakeQueue:
+        def __init__(self):
+            self.enqueued: list[str] = []
+
+        def enqueue_dispatches(self, dispatches):
+            values = list(dispatches)
+            self.enqueued.extend(dispatch.item_id for dispatch in values)
+            return {dispatch.item_id: dispatch.job_id for dispatch in values}
+
+        def stale_item_ids(self, job_ids):
+            return {item_id for item_id, job_id in job_ids.items() if job_id.startswith("orphan-")}
+
+    queue = FakeQueue()
+    app.dependency_overrides[get_analysis_queue] = lambda: queue
+    try:
+        baseline = review_client.post(
+            "/requirement-baselines", json={"name": "Orphan recovery URS", "system": "fleet_manager"}
+        ).json()
+        review_client.post(
+            f"/requirement-baselines/{baseline['id']}/requirements/import",
+            files={"file": ("urs.csv", b"requirement_code,requirement_text\nURS-001,Record retention\n", "text/csv")},
+        )
+        review = review_client.post(
+            "/review-packages",
+            json={
+                "name": "Orphan recovery review",
+                "system": "fleet_manager",
+                "requirement_baseline_id": baseline["id"],
+                "design_document_version_ids": [create_design_document(review_client)],
+            },
+        ).json()
+        run = review_client.post(f"/review-packages/{review['id']}/analyses").json()
+
+        db = database.get_session_factory()()
+        persisted = db.get(AnalysisRun, run["id"])
+        assert persisted is not None
+        persisted.items[0].job_id = f"orphan-{persisted.items[0].id}"
+        db.commit()
+        db.close()
+
+        db = database.get_session_factory()()
+        result = AnalysisReliabilityService(db, get_settings()).tick(queue)
+        db.close()
+
+        progress = review_client.get(f"/analysis-runs/{run['id']}/progress").json()
+        assert progress["queued_items"] == 1
+        assert result["stale_jobs"] == 1
+        assert queue.enqueued.count(progress["items"][0]["id"]) == 2
+
+        db = database.get_session_factory()()
+        refreshed = db.get(AnalysisRun, run["id"])
+        assert refreshed is not None
+        assert refreshed.items[0].dispatch_version == 1
+        assert refreshed.items[0].job_id == f"analysis-{refreshed.items[0].id}-1"
+        db.close()
+    finally:
+        app.dependency_overrides.pop(get_analysis_queue, None)
 
 
 def test_review_packages_are_private_to_the_owner_within_an_organization(review_client: TestClient):
@@ -526,6 +639,54 @@ def test_csv_upload_preserves_rows_as_citable_chunks(review_client: TestClient):
     assert len(chunks) == 2
     assert chunks[0]["section"] == "CSV row 1"
     assert "owner: Automation" in chunks[0]["content"]
+
+
+def test_citation_reader_returns_the_requested_passage_in_source_order(review_client: TestClient):
+    version_id = create_design_document(review_client, document_type="TECHNICAL_MANUAL")
+    response = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={
+            "file": (
+                "interface_register.csv",
+                b"interface,owner\nWCS API,Automation\nMES API,IT\n",
+                "text/csv",
+            )
+        },
+    )
+    assert response.status_code == 200
+    chunks = review_client.get(f"/documents/{version_id}/chunks").json()
+
+    context = review_client.get(f"/documents/{version_id}/chunks/{chunks[1]['id']}/context")
+
+    assert context.status_code == 200
+    payload = context.json()
+    assert payload["requested_chunk_id"] == chunks[1]["id"]
+    assert [item["id"] for item in payload["chunks"]] == [item["id"] for item in chunks]
+    assert "MES API" in payload["chunks"][-1]["content"]
+
+
+def test_original_pdf_source_is_available_for_the_in_app_page_viewer(review_client: TestClient):
+    import fitz
+
+    source = fitz.open()
+    page = source.new_page()
+    page.insert_text((72, 72), "Fleet Manager source page")
+    source_bytes = source.tobytes()
+    source.close()
+    version_id = create_design_document(review_client)
+
+    uploaded = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("fleet_manager.pdf", source_bytes, "application/pdf")},
+    )
+    assert uploaded.status_code == 200
+
+    response = review_client.get(f"/documents/{version_id}/source")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.headers["content-disposition"] == "inline"
+    assert response.content == source_bytes
 
 
 def test_stored_document_can_be_reparsed_with_the_current_chunk_configuration(review_client: TestClient):

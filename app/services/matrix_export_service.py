@@ -9,8 +9,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from app.api.schemas import MatrixRowResponse
 from app.domain.models import AnalysisRun, DocumentVersion, ReviewPackage
+from app.domain.ports import TraceabilityMatrixRow
 
 
 class MatrixExportService:
@@ -38,7 +38,7 @@ class MatrixExportService:
         *,
         review: ReviewPackage,
         run: AnalysisRun,
-        rows: Iterable[MatrixRowResponse],
+        rows: Iterable[TraceabilityMatrixRow],
         documents: Iterable[DocumentVersion],
     ) -> bytes:
         workbook = Workbook()
@@ -53,7 +53,7 @@ class MatrixExportService:
         workbook.save(output)
         return output.getvalue()
 
-    def _write_matrix(self, sheet, rows: Iterable[MatrixRowResponse]) -> None:
+    def _write_matrix(self, sheet, rows: Iterable[TraceabilityMatrixRow]) -> None:
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = f"A1:{get_column_letter(len(self.MATRIX_HEADERS))}1"
         header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -92,7 +92,7 @@ class MatrixExportService:
             sheet.row_dimensions[row_index].height = 72
 
     @staticmethod
-    def _format_evidence(row: MatrixRowResponse) -> str:
+    def _format_evidence(row: TraceabilityMatrixRow) -> str:
         if not row.evidence:
             return ""
         return "\n\n".join(
@@ -101,7 +101,7 @@ class MatrixExportService:
         )
 
     @staticmethod
-    def _format_audit_points(row: MatrixRowResponse) -> str:
+    def _format_audit_points(row: TraceabilityMatrixRow) -> str:
         if not row.audit_points:
             return ""
         values = []

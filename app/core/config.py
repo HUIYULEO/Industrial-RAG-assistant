@@ -13,10 +13,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application settings with safe local-development defaults."""
 
-    app_name: str = "Industrial Design Review RAG"
     database_url: str = "sqlite:///./data/design_review.db"
     data_dir: Path = Path("data")
-    default_output_language: str = "en"
     milvus_uri: str = "http://localhost:19530"
     milvus_collection: str = "knowledge_chunks"
     # Chat and embeddings may use different providers. This permits, for
@@ -70,6 +68,10 @@ class Settings(BaseSettings):
     analysis_retry_delays_seconds: list[int] = [2, 5]
     analysis_job_timeout_seconds: int = 300
     analysis_progress_poll_seconds: float = 1.0
+    analysis_lease_seconds: int = 360
+    analysis_heartbeat_interval_seconds: int = 30
+    analysis_maintenance_poll_seconds: float = 2.0
+    worker_build_version: str = "local"
 
     model_config = SettingsConfigDict(
         env_file=".env",

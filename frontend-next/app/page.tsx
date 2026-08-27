@@ -1,11 +1,12 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, json } from "../lib/api";
-import type { AnalysisProgress, AuthConfig, ChatAnswer, DocumentVersion, Finding, MatrixRow, Requirement, RequirementBaseline, ReviewPackage, User } from "../lib/types";
+import { api, ApiError, json, streamSse } from "../lib/api";
+import type { AnalysisProgress, AuthConfig, ChatAnswer, DocumentChunkContext, DocumentVersion, Finding, MatrixRow, Requirement, RequirementBaseline, ReviewPackage, User } from "../lib/types";
 
 type View = "assistant" | "review" | "knowledge" | "help";
 type Message = { role: "user" | "assistant"; content: string; citations?: ChatAnswer["citations"]; limitations?: string | null };
+type Citation = ChatAnswer["citations"][number];
 const CHAT_HISTORY_LIMIT = 40; // 20 question-and-answer rounds.
 
 function isSavedMessage(value: unknown): value is Message {
@@ -111,7 +112,10 @@ function AuthGate({ onAuthenticated }: { onAuthenticated: (token: string, user: 
 function Assistant({ token, userId, reviews, activeReviewId }: { token: string; userId: string; reviews: ReviewPackage[]; activeReviewId: string | null }) {
   const historyKey = activeReviewId ? `industrial-rag-chat-history:${userId}:${activeReviewId}` : null;
   const [historyByKey, setHistoryByKey] = useState<Record<string, Message[]>>({});
-  const [question, setQuestion] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
+  const [question, setQuestion] = useState(""); const [busy, setBusy] = useState(false); const [streamPhase, setStreamPhase] = useState<"retrieving" | "answering" | null>(null); const [error, setError] = useState<string | null>(null);
+  const [sourceReader, setSourceReader] = useState<{ citation: Citation; context: DocumentChunkContext | null; error: string | null; view: "passage" | "pdf"; pdfUrl: string | null; pdfError: string | null; pdfLoading: boolean } | null>(null);
+  const abortController = useRef<AbortController | null>(null);
+  const pdfObjectUrl = useRef<string | null>(null);
   const activeReview = reviews.find((review) => review.id === activeReviewId);
   const messages = historyKey ? (historyByKey[historyKey] ?? []) : [];
   useEffect(() => {
@@ -127,16 +131,63 @@ function Assistant({ token, userId, reviews, activeReviewId }: { token: string; 
     });
   }
   async function send(event: FormEvent) {
-    event.preventDefault(); if (!question.trim() || !activeReviewId) return;
-    const input = question.trim(); const userMessage: Message = { role: "user", content: input }; const conversationHistory = [...messages, userMessage].slice(-12).map(({ role, content }) => ({ role, content })); setQuestion(""); updateMessages((current) => [...current, userMessage]); setBusy(true); setError(null);
-    try { const result = await api<ChatAnswer>("/design-review/chat", json({ question: input, review_package_id: activeReviewId, conversation_history: conversationHistory }), token); updateMessages((current) => [...current, { role: "assistant", content: result.answer, citations: result.citations, limitations: result.limitations }]); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "The answer could not be generated."); }
-    finally { setBusy(false); }
+    event.preventDefault(); if (busy || !question.trim() || !activeReviewId) return;
+    const input = question.trim(); const userMessage: Message = { role: "user", content: input }; const conversationHistory = [...messages, userMessage].slice(-12).map(({ role, content }) => ({ role, content })); setQuestion(""); updateMessages((current) => [...current, userMessage, { role: "assistant", content: "" }]); setBusy(true); setStreamPhase("retrieving"); setError(null);
+    const controller = new AbortController();
+    abortController.current = controller;
+    try {
+      await streamSse("/design-review/chat/stream", { ...json({ question: input, review_package_id: activeReviewId, conversation_history: conversationHistory }), signal: controller.signal }, token, ({ event: name, data }) => {
+        if (name === "status" && typeof data === "object" && data !== null && "phase" in data) { const phase = (data as { phase: string }).phase; setStreamPhase(phase === "retrieving" ? "retrieving" : "answering"); return; }
+        if (name === "token" && typeof data === "object" && data !== null && "text" in data) { const text = String((data as { text: unknown }).text); updateMessages((current) => { const next = [...current]; const latest = next.at(-1); if (latest?.role === "assistant") next[next.length - 1] = { ...latest, content: latest.content + text }; return next; }); return; }
+        if (name === "final" && typeof data === "object" && data !== null) { const result = data as ChatAnswer; updateMessages((current) => { const next = [...current]; const latest = next.at(-1); if (latest?.role === "assistant") next[next.length - 1] = { role: "assistant", content: result.answer, citations: result.citations, limitations: result.limitations }; return next; }); return; }
+        if (name === "error") { const detail = typeof data === "object" && data !== null && "detail" in data ? String((data as { detail: unknown }).detail) : "The answer could not be generated."; throw new Error(detail); }
+      });
+    } catch (reason) { updateMessages((current) => { const latest = current.at(-1); return latest?.role === "assistant" && !latest.content ? current.slice(0, -1) : current; }); if (!(reason instanceof DOMException && reason.name === "AbortError")) setError(reason instanceof Error ? reason.message : "The answer could not be generated."); }
+    finally { if (abortController.current === controller) abortController.current = null; setBusy(false); setStreamPhase(null); }
   }
+  useEffect(() => () => { if (pdfObjectUrl.current) URL.revokeObjectURL(pdfObjectUrl.current); }, []);
+  function stopGenerating() { abortController.current?.abort(); }
+  function releasePdfObjectUrl() { if (pdfObjectUrl.current) { URL.revokeObjectURL(pdfObjectUrl.current); pdfObjectUrl.current = null; } }
+  function closeSourceReader() { releasePdfObjectUrl(); setSourceReader(null); }
+  async function openSourceReader(citation: Citation) {
+    releasePdfObjectUrl();
+    setSourceReader({ citation, context: null, error: null, view: "passage", pdfUrl: null, pdfError: null, pdfLoading: false });
+    try {
+      const context = await api<DocumentChunkContext>(`/documents/${citation.document_version_id}/chunks/${citation.chunk_id}/context`, {}, token);
+      setSourceReader((current) => current?.citation.chunk_id === citation.chunk_id ? { ...current, context } : current);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "The source passage could not be opened.";
+      setSourceReader((current) => current?.citation.chunk_id === citation.chunk_id ? { ...current, error: message } : current);
+    }
+  }
+  async function openOriginalPdfPage() {
+    if (!sourceReader) return;
+    const citation = sourceReader.citation;
+    setSourceReader((current) => current?.citation.chunk_id === citation.chunk_id ? { ...current, view: "pdf", pdfLoading: true, pdfError: null } : current);
+    try {
+      const response = await fetch(`/api/backend/documents/${citation.document_version_id}/source`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      if (!response.ok) {
+        const payload: unknown = await response.json().catch(() => null);
+        const detail = typeof payload === "object" && payload !== null && "detail" in payload ? String((payload as { detail: unknown }).detail) : "The original PDF could not be opened.";
+        throw new Error(detail);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      setSourceReader((current) => {
+        if (current?.citation.chunk_id !== citation.chunk_id) { URL.revokeObjectURL(url); return current; }
+        releasePdfObjectUrl();
+        pdfObjectUrl.current = url;
+        return { ...current, pdfUrl: url, pdfLoading: false };
+      });
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "The original PDF could not be opened.";
+      setSourceReader((current) => current?.citation.chunk_id === citation.chunk_id ? { ...current, pdfLoading: false, pdfError: message } : current);
+    }
+  }
+  const citedAnswers = messages.map((message, index) => ({ message, index })).filter(({ message }) => message.role === "assistant" && (message.citations?.length ?? 0) > 0).reverse();
   return <section className="workspace-grid assistant-grid"><div className="panel conversation-panel"><div className="panel-header"><div><p className="eyebrow">EVIDENCE Q&A</p><h2>Ask inside the boundary</h2></div>{activeReview && <span className="scope-chip">{activeReview.name}</span>}</div>
-    <div className="conversation">{messages.length ? messages.map((message, index) => <article key={index} className={`message ${message.role}`}><span>{message.role === "user" ? "ENGINEER" : "ASSISTANT"}</span><p>{message.content}</p>{message.limitations && <small>Limitation: {message.limitations}</small>}</article>) : <p className="muted">The latest 20 question-and-answer rounds are retained for this review package in this browser.</p>}</div>
-    {error && <Notice kind="error">{error}</Notice>}<form className="composer" onSubmit={send}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder={activeReviewId ? "Ask a technical question about the selected design versions…" : "Select a review package in the header first."} disabled={!activeReviewId || busy} /><button className="primary" disabled={!activeReviewId || busy}>{busy ? "Retrieving…" : "Send"}</button></form>
-  </div><aside className="panel evidence-panel"><p className="eyebrow">CITATION LEDGER</p><h3>Latest supporting evidence</h3>{[...messages].reverse().find((message) => message.citations)?.citations?.map((citation) => <article className="citation" key={citation.chunk_id}><b>{citation.document_title} <small>v{citation.version}</small></b><span>{citation.section ?? "Unsectioned"} · p.{citation.page ?? "—"}</span><p>{citation.excerpt}</p></article>) ?? <p className="muted">Citations appear here after a grounded answer.</p>}</aside></section>;
+    <div className="conversation">{messages.length ? messages.map((message, index) => { const isStreamingAnswer = busy && message.role === "assistant" && index === messages.length - 1; const placeholder = streamPhase === "retrieving" ? "Searching the selected evidence…" : "Writing the evidence-grounded answer…"; return <article key={index} className={`message ${message.role}`}><span>{message.role === "user" ? "ENGINEER" : "ASSISTANT"}</span><p>{message.content || (isStreamingAnswer ? placeholder : "")}</p>{isStreamingAnswer && !message.content && <small>Sources and citations will appear when the answer is complete.</small>}{message.limitations && <small>Limitation: {message.limitations}</small>}</article>; }) : <p className="muted">The latest 20 question-and-answer rounds are retained for this review package in this browser.</p>}</div>
+    {error && <Notice kind="error">{error}</Notice>}<form className="composer" onSubmit={send}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder={activeReviewId ? "Ask a technical question about the selected design versions…" : "Select a review package in the header first."} disabled={!activeReviewId} />{busy ? <button type="button" className="secondary" onClick={stopGenerating}>Stop generating</button> : <button className="primary" disabled={!activeReviewId}>Send</button>}</form>
+  </div><aside className="panel evidence-panel"><p className="eyebrow">CITATION LEDGER</p><h3>Evidence from this conversation</h3>{citedAnswers.length ? citedAnswers.map(({ message, index }, groupIndex) => <details className="citation-group" key={index} open={groupIndex === 0}><summary>Answer {Math.floor(index / 2) + 1} · {message.citations?.length ?? 0} cited passage(s)</summary>{message.citations?.map((citation) => <article className="citation" key={`${index}-${citation.chunk_id}`}><b>{citation.document_title} <small>v{citation.version}</small></b><span>{citation.section ?? "Unsectioned"} · p.{citation.page ?? "—"}</span><p>{citation.excerpt}</p><button type="button" className="citation-read" onClick={() => void openSourceReader(citation)}>Read in source</button></article>)}</details>) : <p className="muted">Citations appear here after a grounded answer.</p>}</aside>{sourceReader && <div className="modal-backdrop source-reader-backdrop" role="presentation" onMouseDown={closeSourceReader}><section className="modal-card source-reader" role="dialog" aria-modal="true" aria-labelledby="source-reader-title" onMouseDown={(event) => event.stopPropagation()}><div className="panel-header"><div><p className="eyebrow">SOURCE READER</p><h2 id="source-reader-title">{sourceReader.citation.document_title}</h2><p className="muted">v{sourceReader.citation.version} · {sourceReader.citation.section ?? "Unsectioned"} · page {sourceReader.citation.page ?? "—"}</p></div><button type="button" className="secondary" onClick={closeSourceReader}>Close</button></div><div className="source-reader-tabs"><button type="button" className={sourceReader.view === "passage" ? "source-reader-tab active" : "source-reader-tab"} onClick={() => setSourceReader((current) => current ? { ...current, view: "passage" } : current)}>Passage text</button><button type="button" className={sourceReader.view === "pdf" ? "source-reader-tab active" : "source-reader-tab"} onClick={() => void openOriginalPdfPage()}>Original PDF · p.{sourceReader.citation.page ?? 1}</button></div>{sourceReader.view === "pdf" ? sourceReader.pdfError ? <Notice kind="error">{sourceReader.pdfError}</Notice> : sourceReader.pdfLoading || !sourceReader.pdfUrl ? <Notice>Loading original PDF page…</Notice> : <iframe className="pdf-page-viewer" title={`${sourceReader.citation.document_title} page ${sourceReader.citation.page ?? 1}`} src={`${sourceReader.pdfUrl}#page=${Math.max(1, sourceReader.citation.page ?? 1)}`} /> : sourceReader.error ? <Notice kind="error">{sourceReader.error}</Notice> : !sourceReader.context ? <Notice>Opening the original passage…</Notice> : <div className="source-passages">{sourceReader.context.chunks.map((chunk) => <article key={chunk.id} className={`source-passage ${chunk.id === sourceReader.context?.requested_chunk_id ? "source-passage-active" : ""}`}><div><span>Passage {chunk.chunk_index + 1}</span><small>{chunk.section ?? "Unsectioned"} · p.{chunk.page}</small></div><pre>{chunk.content}</pre></article>)}</div>}</section></div>}</section>;
 }
 
 function LiveRun({ token, runId, onSettled }: { token: string; runId: string; onSettled: () => void }) {
@@ -151,7 +202,7 @@ function LiveRun({ token, runId, onSettled }: { token: string; runId: string; on
   return <section className="panel live-run"><div className="panel-header"><div><p className="eyebrow">ASYNC ANALYSIS</p><h2>Requirement workboard</h2></div><Tag value={progress.status} /></div><div className="progress-line"><span style={{ width: `${progress.total_items ? (settled / progress.total_items) * 100 : 0}%` }} /></div><div className="metrics"><div><b>{settled}</b><span>settled</span></div><div><b>{progress.running_items}</b><span>active</span></div><div><b>{progress.failed_items}</b><span>failed</span></div></div>
     {error && <Notice kind="error">{error}</Notice>}
     {failedItems.length > 0 && <section className="failure-panel" aria-live="polite"><div className="failure-panel-header"><div><p className="eyebrow">FAILURE DIAGNOSTICS</p><h3>{failedItems.length} requirement{failedItems.length === 1 ? "" : "s"} need attention</h3><p>The recorded error is retained below. Retrying queues only the failed requirements; completed findings remain unchanged.</p></div><button className="secondary" disabled={retrying} onClick={retry}>{retrying ? "Queueing…" : `Retry ${failedItems.length} failed requirement${failedItems.length === 1 ? "" : "s"}`}</button></div>{progress.error_message && <Notice kind="error">{progress.error_message}</Notice>}<div className="failure-list">{failedItems.map((item) => <details className="failure-entry" key={item.id} open><summary><code>{item.requirement_code}</code><span>Attempt {item.attempt_count}</span></summary><pre>{item.error_message ?? "No diagnostic message was returned by the worker."}</pre></details>)}</div></section>}
-    <div className="item-list">{progress.items.map((item) => <div className="item-row" key={item.id}><code>{item.requirement_code}</code><Tag value={item.status} /><span>attempt {item.attempt_count}</span>{item.error_message && <small>Diagnostic recorded</small>}</div>)}</div>
+    <div className="item-list">{progress.items.map((item) => <div className="item-row" key={item.id}><code>{item.requirement_code}</code><Tag value={item.status} /><span>attempt {item.attempt_count}</span>{item.error_message && <small title={item.error_message}>{item.error_message}</small>}</div>)}</div>
     {findings.length > 0 && <p className="muted">{findings.length} finding{findings.length === 1 ? "" : "s"} already available while remaining items finish.</p>}
   </section>;
 }

@@ -19,13 +19,16 @@ from sqlalchemy.orm import Session
 from app.domain.models import DocumentChunk, DocumentFigure, DocumentVersion
 from app.services.visual_evidence_service import VisualEvidenceService
 
-_HEADING_PATTERN = re.compile(r"^(?:\d+(?:\.\d+){0,5}\s+.+|[A-Z][A-Z\s/&-]{5,})$")
+_HEADING_PATTERN = re.compile(r"^(?:\d+(?:\.\d+){0,5}\.?\s+.+|[A-Z][A-Z\s/&-]{5,})$")
 
 # Change these code-level defaults when the corpus requires a different
-# character-based segmentation strategy.  Existing documents must be reparsed
+# structure-aware segmentation strategy. Existing documents must be reparsed
 # and re-indexed for a change to take effect.
 DEFAULT_CHUNK_SIZE = 2_200
-DEFAULT_CHUNK_OVERLAP = 300
+# Citable passages are also read by people. Duplicating the end of one passage
+# at the start of the next made the source reader look like a damaged copy of
+# the original document, so chunks deliberately do not overlap.
+DEFAULT_CHUNK_OVERLAP = 0
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,48 @@ class DocumentIngestionService:
             )
         )
 
+    def get_chunk_context(
+        self, document_version_id: str, chunk_id: str, *, radius: int = 1
+    ) -> list[DocumentChunk]:
+        """Return one cited passage with its immediate source neighbours."""
+        chunk = self.db.scalar(
+            select(DocumentChunk).where(
+                DocumentChunk.id == chunk_id,
+                DocumentChunk.document_version_id == document_version_id,
+            )
+        )
+        if chunk is None:
+            raise LookupError("Source passage was not found in this document version")
+        return list(
+            self.db.scalars(
+                select(DocumentChunk)
+                .where(
+                    DocumentChunk.document_version_id == document_version_id,
+                    DocumentChunk.chunk_index >= max(chunk.chunk_index - radius, 0),
+                    DocumentChunk.chunk_index <= chunk.chunk_index + radius,
+                )
+                .order_by(DocumentChunk.chunk_index)
+            )
+        )
+
+    def get_pdf_source_path(self, document_version_id: str) -> Path:
+        """Return a managed original PDF for authenticated in-app reading."""
+        version = self.db.get(DocumentVersion, document_version_id)
+        if version is None:
+            raise LookupError("Document version not found")
+        if not version.storage_path:
+            raise LookupError("The original source file is unavailable")
+        source_path = Path(version.storage_path)
+        if source_path.suffix.lower() != ".pdf":
+            raise ValueError("The original-page viewer is available only for PDF sources")
+        try:
+            resolved_path = source_path.resolve(strict=True)
+            raw_root = (self.data_dir / "raw").resolve(strict=True)
+            resolved_path.relative_to(raw_root)
+        except (FileNotFoundError, ValueError) as exc:
+            raise LookupError("The original source file is unavailable") from exc
+        return resolved_path
+
     def _parse_source(self, path: Path, suffix: str, *, pdf_password: str | None = None) -> tuple[list[ParsedChunk], int]:
         if suffix == ".pdf":
             return self._parse_pdf(path, pdf_password=pdf_password)
@@ -203,7 +248,15 @@ class DocumentIngestionService:
         chunks: list[ParsedChunk] = []
         current_section: str | None = None
         for page_number, page in enumerate(reader.pages, start=1):
-            page_text = (page.extract_text() or "").strip()
+            # The layout mode retains paragraph breaks, indentation and table
+            # spacing where the PDF exposes them. The plain extractor is kept
+            # as a compatibility fallback for PDFs whose producer metadata is
+            # incomplete.
+            try:
+                page_text = page.extract_text(extraction_mode="layout") or ""
+            except Exception:
+                page_text = page.extract_text() or ""
+            page_text = self._preserve_pdf_layout(page_text)
             if not page_text:
                 continue
             page_chunks, current_section = self._chunk_page(page_text, page_number, current_section)
@@ -298,7 +351,7 @@ class DocumentIngestionService:
 
         def flush() -> None:
             if buffer:
-                text = self._normalise_text("\n".join(buffer))
+                text = self._preserve_pdf_layout("\n".join(buffer), trim_outer=False)
                 if text:
                     result.extend(self._split_buffer(text, page, current_section))
                 buffer.clear()
@@ -307,14 +360,17 @@ class DocumentIngestionService:
         # paragraphs. Detect headings before joining content, otherwise a heading
         # can be buried inside a page-sized text block and lose its provenance.
         for raw_line in page_text.splitlines():
-            line = self._normalise_text(raw_line)
-            if not line:
+            # Keep the source line unchanged in the persisted passage. The
+            # stripped value is used only to recognise headings.
+            line = raw_line.rstrip()
+            display_line = line.strip()
+            if not display_line:
                 if buffer and buffer[-1] != "":
                     buffer.append("")
                 continue
-            if _HEADING_PATTERN.match(line) and len(line) <= 250:
+            if _HEADING_PATTERN.match(display_line) and len(display_line) <= 250:
                 flush()
-                current_section = line
+                current_section = display_line
                 continue
             buffer.append(line)
         flush()
@@ -328,14 +384,36 @@ class DocumentIngestionService:
         while start < len(text):
             end = min(start + self.chunk_size, len(text))
             if end < len(text):
-                boundary = max(text.rfind(". ", start, end), text.rfind("\n", start, end))
-                if boundary > start + self.chunk_size // 2:
-                    end = boundary + 1
-            chunks.append(ParsedChunk(page=page, section=section, content=text[start:end].strip()))
+                end = self._semantic_break(text, start, end)
+            # Do not left-strip: indentation is meaningful in bullet lists and
+            # tables, and the same content is shown in the citation reader.
+            chunks.append(ParsedChunk(page=page, section=section, content=text[start:end].rstrip()))
             if end >= len(text):
                 break
+            # An overlap makes a source citation repeat content when read.
+            # Retain it only for callers that explicitly opt into it.
             start = max(end - self.chunk_overlap, start + 1)
         return chunks
+
+    def _semantic_break(self, text: str, start: int, proposed_end: int) -> int:
+        """Choose a human-readable break instead of cutting a sentence mid-way."""
+        minimum = start + self.chunk_size // 3
+        candidates: list[int] = []
+        for separator in ("\n\n", "\n"):
+            index = text.rfind(separator, start, proposed_end)
+            if index >= minimum:
+                candidates.append(index + len(separator))
+        sentence_ends = [match.end() for match in re.finditer(r"[.!?。！？；;](?:\s|$)", text[start:proposed_end])]
+        if sentence_ends:
+            candidates.append(start + sentence_ends[-1])
+        return max(candidates, default=proposed_end)
+
+    @staticmethod
+    def _preserve_pdf_layout(text: str, *, trim_outer: bool = True) -> str:
+        """Remove extraction artefacts without flattening the original layout."""
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "").split("\n")
+        result = "\n".join(line.replace("\u00a0", " ").rstrip() for line in lines)
+        return result.strip() if trim_outer else result.rstrip()
 
     @staticmethod
     def _normalise_text(text: str) -> str:

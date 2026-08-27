@@ -23,7 +23,9 @@ logs/
 *.log
 coverage
 archieve/tmpclaude-*
+diagrams
 
 #plan files
 UPGRADE_GUIDE.md
 IMPROVEMENT_PLAN.md
+local-debug-runbook.md

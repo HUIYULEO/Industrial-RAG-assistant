@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.domain.models import DocumentChunk, DocumentVersion
-from app.repositories.milvus_repository import MilvusChunkRepository
+from app.domain.ports import DocumentChunkIndex
 from app.services.embedding_service import EmbeddingService
 
 
@@ -30,7 +30,7 @@ class DocumentIndexingService:
         self,
         db: Session,
         embeddings: EmbeddingService,
-        repository: MilvusChunkRepository,
+        repository: DocumentChunkIndex,
         *,
         batch_token_budget: int = 10_000,
         tokens_per_minute: int = 30_000,

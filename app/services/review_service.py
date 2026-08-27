@@ -10,6 +10,11 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.domain.analysis import (
+    ACTIVE_ITEM_STATUSES,
+    CURRENT_ANALYSIS_TASK_SCHEMA_VERSION,
+    apply_run_status,
+)
 from app.domain.enums import DESIGN_DOCUMENT_TYPES, DocumentStatus, DocumentType
 from app.domain.models import (
     Document,
@@ -21,6 +26,7 @@ from app.domain.models import (
     ReviewPackageRequirement,
     AnalysisRun,
     AnalysisRunItem,
+    AnalysisDispatchOutbox,
     ReviewFinding,
 )
 
@@ -437,6 +443,15 @@ class ReviewService:
             for requirement in review.requirement_snapshots
         ]
         self.db.add(run)
+        self.db.flush()
+        self.db.add_all(
+            AnalysisDispatchOutbox(
+                analysis_run_item_id=item.id,
+                dispatch_version=item.dispatch_version,
+                task_schema_version=CURRENT_ANALYSIS_TASK_SCHEMA_VERSION,
+            )
+            for item in run.items
+        )
         self.db.commit()
         self.db.refresh(run)
         return run
@@ -475,42 +490,16 @@ class ReviewService:
         Workers commit their items independently.  A restart between the item
         commit and the run-summary commit must not leave the workboard running
         forever after every item has settled.
+
+        A run that still has active items is deliberately left alone: its worker
+        and the maintenance loop own that summary, and this method runs on every
+        read, including the once-per-second progress stream.
         """
         statuses = [item.status for item in run.items]
-        if any(status in {"queued", "running", "retrying"} for status in statuses):
+        if any(status in ACTIVE_ITEM_STATUSES for status in statuses):
             return
-        if any(status == "failed" for status in statuses):
-            failed_count = sum(status == "failed" for status in statuses)
-            next_status = "failed"
-            next_error = f"{failed_count} analysis item(s) failed; retry failed items to continue."
-        else:
-            next_status = "completed"
-            next_error = None
-        if run.status == next_status and run.error_message == next_error and run.completed_at is not None:
-            return
-        run.status = next_status
-        run.error_message = next_error
-        run.completed_at = datetime.now(timezone.utc)
-        self.db.commit()
-
-    def set_analysis_item_job_ids(self, run_id: str, job_ids: dict[str, str]) -> AnalysisRun:
-        run = self.get_analysis_run(run_id)
-        for item in run.items:
-            if item.id in job_ids:
-                item.job_id = job_ids[item.id]
-        self.db.commit()
-        return self.get_analysis_run(run_id)
-
-    def mark_analysis_run_enqueue_failed(self, run_id: str, message: str) -> AnalysisRun:
-        run = self.get_analysis_run(run_id)
-        run.status = "failed"
-        run.error_message = message
-        for item in run.items:
-            if item.status == "queued":
-                item.status = "failed"
-                item.error_message = message
-        self.db.commit()
-        return self.get_analysis_run(run_id)
+        if apply_run_status(run, statuses, datetime.now(timezone.utc)):
+            self.db.commit()
 
     def retry_failed_analysis_items(self, run_id: str) -> list[AnalysisRunItem]:
         run = self.get_analysis_run(run_id)
@@ -522,10 +511,21 @@ class ReviewService:
         run.completed_at = None
         for item in failed:
             item.status = "queued"
+            item.dispatch_version += 1
             item.job_id = None
+            item.lease_owner = None
+            item.lease_expires_at = None
+            item.heartbeat_at = None
             item.error_message = None
             item.started_at = None
             item.completed_at = None
+            self.db.add(
+                AnalysisDispatchOutbox(
+                    analysis_run_item_id=item.id,
+                    dispatch_version=item.dispatch_version,
+                    task_schema_version=CURRENT_ANALYSIS_TASK_SCHEMA_VERSION,
+                )
+            )
         self.db.commit()
         return failed
 

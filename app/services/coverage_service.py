@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from inspect import Parameter, signature
 from time import sleep
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
+from app.domain.analysis import apply_run_status
 from app.domain.evidence import EvidenceChunk, RetrievalFilters
 from app.domain.enums import DESIGN_DOCUMENT_TYPES, CoverageStatus
-from app.domain.models import AnalysisRun, AnalysisRunItem, FindingEvidence, ReviewFinding, ReviewPackage
+from app.domain.models import (
+    AnalysisAttempt,
+    AnalysisRun,
+    AnalysisRunItem,
+    FindingEvidence,
+    ReviewFinding,
+    ReviewPackage,
+)
+from app.services.analysis_reliability_service import renew_analysis_lease
 from app.services.retrieval_service import RetrievalService
+
+
+class LeaseLostError(RuntimeError):
+    """Raised when another worker or the watchdog owns the analysis item."""
 
 
 class CandidateJudgment(BaseModel):
@@ -46,7 +60,38 @@ class AuditPointJudgment(AuditPoint):
 
 
 class FindingJudge(Protocol):
+    """Minimum contract a third-party design-finding judge must satisfy.
+
+    An implementation may additionally accept ``audit_points`` in ``judge`` and
+    expose ``decompose`` (see :class:`AuditPointPlanner`).  Both are detected
+    per implementation, so an adapter written against this signature alone keeps
+    working.
+    """
+
     def judge(self, *, requirement_code: str, requirement_text: str, evidence: list[EvidenceChunk]) -> CandidateJudgment: ...
+
+
+class AuditPointPlanner(Protocol):
+    """Optional capability: split one URS into separately checkable points."""
+
+    def decompose(self, *, requirement_code: str, requirement_text: str) -> list[AuditPoint]: ...
+
+
+def _accepts_audit_points(judge: FindingJudge) -> bool:
+    """Report whether this judge's ``judge`` takes the ``audit_points`` extension.
+
+    The signature is inspected rather than probed by calling and catching
+    ``TypeError``: a probe cannot tell an unsupported keyword apart from a
+    ``TypeError`` raised inside the implementation, and silently swallowing the
+    latter hides real adapter faults behind a second, weaker call.
+    """
+    try:
+        parameters = signature(judge.judge).parameters
+    except (TypeError, ValueError):  # C-implemented or otherwise opaque callables
+        return True
+    if "audit_points" in parameters:
+        return True
+    return any(item.kind is Parameter.VAR_KEYWORD for item in parameters.values())
 
 
 class ConfiguredDesignFindingJudge:
@@ -148,59 +193,199 @@ class CoverageAnalysisService:
         *,
         max_attempts: int,
         retry_delays_seconds: list[int],
+        worker_id: str | None = None,
+        lease_seconds: int = 360,
+        expected_dispatch_version: int | None = None,
     ) -> AnalysisRun:
-        """Evaluate one frozen URS item with durable retry state."""
+        """Evaluate one frozen URS item after atomically acquiring its lease."""
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        worker_id = worker_id or f"inline:{analysis_run_item_id}"
 
-        item = self._get_item(analysis_run_item_id)
-        if item.status == "completed":
-            return self._get_run(item.analysis_run_id)
-
-        for local_attempt in range(max_attempts):
-            item = self._get_item(analysis_run_item_id)
-            item.status = "running"
-            item.attempt_count += 1
-            item.started_at = datetime.now(timezone.utc)
-            item.error_message = None
-            item.analysis_run.status = "running"
-            item.analysis_run.error_message = None
-            self.db.commit()
-            try:
-                self._evaluate_item(item)
+        while True:
+            claim = self._claim_attempt(
+                analysis_run_item_id,
+                worker_id=worker_id,
+                max_attempts=max_attempts,
+                lease_seconds=lease_seconds,
+                expected_dispatch_version=expected_dispatch_version,
+            )
+            if claim is None:
                 item = self._get_item(analysis_run_item_id)
-                item.status = "completed"
-                item.completed_at = datetime.now(timezone.utc)
-                item.error_message = None
-                self._update_run_status(item.analysis_run_id)
-                self.db.commit()
                 return self._get_run(item.analysis_run_id)
+            run_id, attempt_number = claim
+            try:
+                item = self._get_item(analysis_run_item_id)
+                self._evaluate_item(item, worker_id=worker_id, lease_seconds=lease_seconds)
+                now = datetime.now(timezone.utc)
+                result = self.db.execute(
+                    update(AnalysisRunItem)
+                    .where(
+                        AnalysisRunItem.id == analysis_run_item_id,
+                        AnalysisRunItem.status == "running",
+                        AnalysisRunItem.lease_owner == worker_id,
+                    )
+                    .values(
+                        status="completed",
+                        completed_at=now,
+                        error_message=None,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        heartbeat_at=None,
+                    )
+                )
+                if not result.rowcount:
+                    self.db.rollback()
+                    return self._get_run(run_id)
+                self._finish_attempt(
+                    analysis_run_item_id,
+                    attempt_number,
+                    status="completed",
+                    completed_at=now,
+                )
+                self._update_run_status(run_id)
+                self.db.commit()
+                return self._get_run(run_id)
+            except LeaseLostError:
+                self.db.rollback()
+                return self._get_run(run_id)
             except Exception as exc:
                 self.db.rollback()
-                item = self._get_item(analysis_run_item_id)
-                can_retry = self._is_retryable(exc) and local_attempt + 1 < max_attempts
-                item.error_message = str(exc)
+                can_retry = self._is_retryable(exc) and attempt_number < max_attempts
+                now = datetime.now(timezone.utc)
+                self._finish_attempt(
+                    analysis_run_item_id,
+                    attempt_number,
+                    status="failed",
+                    completed_at=now,
+                    error_class=exc.__class__.__name__,
+                    error_message=str(exc),
+                )
                 if can_retry:
-                    item.status = "retrying"
-                    self._update_run_status(item.analysis_run_id)
+                    self.db.execute(
+                        update(AnalysisRunItem)
+                        .where(
+                            AnalysisRunItem.id == analysis_run_item_id,
+                            AnalysisRunItem.status == "running",
+                            AnalysisRunItem.lease_owner == worker_id,
+                        )
+                        .values(
+                            error_message=str(exc),
+                            heartbeat_at=now,
+                            lease_expires_at=now + timedelta(seconds=lease_seconds),
+                        )
+                    )
                     self.db.commit()
                     delay = (
-                        retry_delays_seconds[min(local_attempt, len(retry_delays_seconds) - 1)]
+                        retry_delays_seconds[min(attempt_number - 1, len(retry_delays_seconds) - 1)]
                         if retry_delays_seconds
                         else 0
                     )
                     if delay > 0:
                         sleep(delay)
                     continue
-                item.status = "failed"
-                item.completed_at = datetime.now(timezone.utc)
-                self._update_run_status(item.analysis_run_id)
+                self.db.execute(
+                    update(AnalysisRunItem)
+                    .where(
+                        AnalysisRunItem.id == analysis_run_item_id,
+                        AnalysisRunItem.status == "running",
+                        AnalysisRunItem.lease_owner == worker_id,
+                    )
+                    .values(
+                        status="failed",
+                        error_message=str(exc),
+                        completed_at=now,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        heartbeat_at=None,
+                    )
+                )
+                self._update_run_status(run_id)
                 self.db.commit()
-                # Keep other queued RQ jobs running and make the partial failure
-                # visible to the UI instead of failing the entire worker process.
-                return self._get_run(item.analysis_run_id)
+                return self._get_run(run_id)
 
-        raise RuntimeError("Analysis item retry loop ended unexpectedly")
+    def _claim_attempt(
+        self,
+        item_id: str,
+        *,
+        worker_id: str,
+        max_attempts: int,
+        lease_seconds: int,
+        expected_dispatch_version: int | None,
+    ) -> tuple[str, int] | None:
+        now = datetime.now(timezone.utc)
+        ownership = or_(
+            AnalysisRunItem.status.in_(["queued", "retrying"]),
+            (AnalysisRunItem.status == "running") & (AnalysisRunItem.lease_owner == worker_id),
+            (AnalysisRunItem.status == "running") & (AnalysisRunItem.lease_expires_at < now),
+        )
+        conditions = [
+            AnalysisRunItem.id == item_id,
+            AnalysisRunItem.attempt_count < max_attempts,
+            ownership,
+        ]
+        if expected_dispatch_version is not None:
+            conditions.append(AnalysisRunItem.dispatch_version == expected_dispatch_version)
+        result = self.db.execute(
+            update(AnalysisRunItem)
+            .where(*conditions)
+            .values(
+                status="running",
+                attempt_count=AnalysisRunItem.attempt_count + 1,
+                started_at=now,
+                completed_at=None,
+                error_message=None,
+                lease_owner=worker_id,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+            .returning(AnalysisRunItem.analysis_run_id, AnalysisRunItem.attempt_count)
+        )
+        row = result.one_or_none()
+        if row is None:
+            self.db.rollback()
+            return None
+        run_id, attempt_number = row
+        self.db.add(
+            AnalysisAttempt(
+                analysis_run_item_id=item_id,
+                attempt_number=attempt_number,
+                worker_id=worker_id,
+                status="running",
+            )
+        )
+        self.db.execute(
+            update(AnalysisRun)
+            .where(AnalysisRun.id == run_id)
+            .values(status="running", error_message=None, completed_at=None)
+        )
+        self.db.commit()
+        return run_id, attempt_number
+
+    def _finish_attempt(
+        self,
+        item_id: str,
+        attempt_number: int,
+        *,
+        status: str,
+        completed_at: datetime,
+        error_class: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        self.db.execute(
+            update(AnalysisAttempt)
+            .where(
+                AnalysisAttempt.analysis_run_item_id == item_id,
+                AnalysisAttempt.attempt_number == attempt_number,
+                AnalysisAttempt.status == "running",
+            )
+            .values(
+                status=status,
+                completed_at=completed_at,
+                error_class=error_class,
+                error_message=error_message,
+            )
+        )
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
@@ -211,7 +396,7 @@ class CoverageAnalysisService:
             return status_code in {408, 429} or status_code >= 500
         return True
 
-    def _evaluate_item(self, item: AnalysisRunItem) -> None:
+    def _evaluate_item(self, item: AnalysisRunItem, *, worker_id: str, lease_seconds: int) -> None:
         run = item.analysis_run
         review = run.review_package
         requirement = item.requirement_snapshot
@@ -221,15 +406,36 @@ class CoverageAnalysisService:
             document_types=sorted(DESIGN_DOCUMENT_TYPES),
         )
         audit_points = self._audit_points(requirement.requirement_code, requirement.requirement_text)
+        self._renew_lease(item.id, worker_id, lease_seconds)
         evidence = self._retrieve_audit_evidence(requirement.requirement_code, audit_points, filters)
+        self._renew_lease(item.id, worker_id, lease_seconds)
         judgment = self._judge(
             requirement.requirement_code,
             requirement.requirement_text,
             audit_points,
             evidence,
         )
+        self._renew_lease(item.id, worker_id, lease_seconds)
+        owned = self.db.scalar(
+            select(AnalysisRunItem)
+            .where(
+                AnalysisRunItem.id == item.id,
+                AnalysisRunItem.status == "running",
+                AnalysisRunItem.lease_owner == worker_id,
+            )
+            .with_for_update()
+        )
+        if owned is None:
+            raise LeaseLostError("The analysis item lease was transferred to another worker")
         self._delete_existing_finding(run.id, requirement.id)
         self._save_finding(run.id, requirement.id, judgment, evidence)
+
+    def _renew_lease(self, item_id: str, worker_id: str, lease_seconds: int) -> None:
+        """Renew the lease mid-evaluation; a lost lease aborts this attempt."""
+        if not renew_analysis_lease(self.db, item_id, worker_id, lease_seconds):
+            self.db.rollback()
+            raise LeaseLostError("The analysis item lease is no longer owned by this worker")
+        self.db.commit()
 
     def _audit_points(self, requirement_code: str, requirement_text: str) -> list[AuditPoint]:
         fallback = [
@@ -239,6 +445,8 @@ class CoverageAnalysisService:
                 review_point=requirement_text,
             )
         ]
+        # decompose is an optional capability; a third-party judge that only
+        # implements FindingJudge assesses the requirement as one atomic point.
         decompose = getattr(self.judge, "decompose", None)
         if not callable(decompose):
             return fallback
@@ -287,21 +495,13 @@ class CoverageAnalysisService:
                     for point in audit_points
                 ],
             )
-        try:
-            judgment = self.judge.judge(
-                requirement_code=requirement_code,
-                requirement_text=requirement_text,
-                evidence=evidence,
-                audit_points=audit_points,
-            )
-        except TypeError:
-            # Existing deterministic test doubles and third-party adapters can
-            # keep the original protocol while the review flow gains audit points.
-            judgment = self.judge.judge(
-                requirement_code=requirement_code,
-                requirement_text=requirement_text,
-                evidence=evidence,
-            )
+        extras = {"audit_points": audit_points} if _accepts_audit_points(self.judge) else {}
+        judgment = self.judge.judge(
+            requirement_code=requirement_code,
+            requirement_text=requirement_text,
+            evidence=evidence,
+            **extras,
+        )
         allowed_ids = {item.chunk_id for item in evidence}
         valid_ids = [item for item in judgment.evidence_chunk_ids if item in allowed_ids]
         point_judgments = self._normalise_audit_points(audit_points, judgment, allowed_ids)
@@ -433,19 +633,7 @@ class CoverageAnalysisService:
                 select(AnalysisRunItem.status).where(AnalysisRunItem.analysis_run_id == run_id)
             )
         )
-        active = {"queued", "running", "retrying"}
-        if any(status in active for status in statuses):
-            run.status = "running" if any(status in {"running", "retrying"} for status in statuses) else "queued"
-            run.completed_at = None
-            return
-        if any(status == "failed" for status in statuses):
-            failed_count = sum(status == "failed" for status in statuses)
-            run.status = "failed"
-            run.error_message = f"{failed_count} analysis item(s) failed; retry failed items to continue."
-        else:
-            run.status = "completed"
-            run.error_message = None
-        run.completed_at = datetime.now(timezone.utc)
+        apply_run_status(run, statuses, datetime.now(timezone.utc))
 
     def _get_run(self, run_id: str) -> AnalysisRun:
         statement = (

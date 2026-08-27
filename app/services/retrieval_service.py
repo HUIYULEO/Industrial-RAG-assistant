@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from app.domain.evidence import EvidenceChunk, RetrievalFilters
-from app.repositories.milvus_repository import MilvusChunkRepository
+from app.domain.ports import DocumentChunkIndex
 from app.services.embedding_service import EmbeddingService
 
 
@@ -20,10 +20,10 @@ class RetrievalService(Protocol):
     def retrieve(self, query: str, filters: RetrievalFilters, limit: int = 8) -> list[EvidenceChunk]: ...
 
 
-class MilvusRetrievalService:
+class HybridRetrievalService:
     """Hybrid search guarded by immutable document-version filters."""
 
-    def __init__(self, *, repository: MilvusChunkRepository, embeddings: EmbeddingService):
+    def __init__(self, *, repository: DocumentChunkIndex, embeddings: EmbeddingService):
         self.repository = repository
         self.embeddings = embeddings
 
