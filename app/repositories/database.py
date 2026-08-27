@@ -65,6 +65,12 @@ def initialise_database() -> None:
             "owner_user_id": "VARCHAR(36)",
             "organization_id": "VARCHAR(36)",
         },
+        "analysis_run_items": {
+            "dispatch_version": "INTEGER NOT NULL DEFAULT 0",
+            "lease_owner": "VARCHAR(160)",
+            "lease_expires_at": "TIMESTAMP WITH TIME ZONE",
+            "heartbeat_at": "TIMESTAMP WITH TIME ZONE",
+        },
     }
     inspector = inspect(engine)
     with engine.begin() as connection:

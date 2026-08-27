@@ -6,9 +6,12 @@ from fastapi import FastAPI, status
 from fastapi.responses import JSONResponse
 
 from app.api.auth import router as auth_router
-from app.api.reviews import router as design_review_router
+from app.api.routes.chat import router as chat_router
+from app.api.routes.documents import router as documents_router
+from app.api.routes.requirements import router as requirements_router
+from app.api.routes.review_packages import router as review_packages_router
+from app.api.routes.analysis_runs import router as analysis_runs_router
 from app.core.config import get_settings
-from app.core.exceptions import IndustrialRAGException
 from app.core.logging_config import get_logger, setup_logging
 from app.repositories.database import get_session_factory, initialise_database
 from app.services.auth_service import AuthService
@@ -37,17 +40,12 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
-app.include_router(design_review_router)
+app.include_router(documents_router)
+app.include_router(chat_router)
+app.include_router(requirements_router)
+app.include_router(review_packages_router)
+app.include_router(analysis_runs_router)
 app.include_router(auth_router)
-
-
-@app.exception_handler(IndustrialRAGException)
-async def industrial_rag_exception_handler(_, exc: IndustrialRAGException):
-    logger.error("Industrial RAG error: %s", exc.message, extra={"details": exc.details})
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"error": exc.__class__.__name__, "message": exc.message, "details": exc.details},
-    )
 
 
 @app.exception_handler(Exception)

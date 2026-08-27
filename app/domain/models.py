@@ -8,6 +8,8 @@ from uuid import uuid4
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, false, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from app.domain.analysis import CURRENT_ANALYSIS_TASK_SCHEMA_VERSION
+
 
 def new_id() -> str:
     return str(uuid4())
@@ -268,7 +270,11 @@ class AnalysisRunItem(Base):
     )
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="queued")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dispatch_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     job_id: Mapped[str | None] = mapped_column(String(64))
+    lease_owner: Mapped[str | None] = mapped_column(String(160))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -276,6 +282,64 @@ class AnalysisRunItem(Base):
 
     analysis_run: Mapped[AnalysisRun] = relationship(back_populates="items")
     requirement_snapshot: Mapped[ReviewPackageRequirement] = relationship()
+    attempts: Mapped[list[AnalysisAttempt]] = relationship(
+        back_populates="analysis_run_item", cascade="all, delete-orphan"
+    )
+    dispatches: Mapped[list[AnalysisDispatchOutbox]] = relationship(
+        back_populates="analysis_run_item", cascade="all, delete-orphan"
+    )
+
+
+class AnalysisAttempt(Base):
+    """Durable execution history for one worker attempt."""
+
+    __tablename__ = "analysis_attempts"
+    __table_args__ = (
+        UniqueConstraint("analysis_run_item_id", "attempt_number", name="uq_analysis_item_attempt"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    analysis_run_item_id: Mapped[str] = mapped_column(
+        ForeignKey("analysis_run_items.id"), nullable=False, index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="running")
+    error_class: Mapped[str | None] = mapped_column(String(200))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    analysis_run_item: Mapped[AnalysisRunItem] = relationship(back_populates="attempts")
+
+
+class AnalysisDispatchOutbox(Base):
+    """Transactional record that must be delivered to Redis/RQ."""
+
+    __tablename__ = "analysis_dispatch_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "analysis_run_item_id", "dispatch_version", name="uq_analysis_item_dispatch_version"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    analysis_run_item_id: Mapped[str] = mapped_column(
+        ForeignKey("analysis_run_items.id"), nullable=False, index=True
+    )
+    dispatch_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    task_schema_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=CURRENT_ANALYSIS_TASK_SCHEMA_VERSION
+    )
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+    job_id: Mapped[str | None] = mapped_column(String(160))
+    publish_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    analysis_run_item: Mapped[AnalysisRunItem] = relationship(back_populates="dispatches")
 
 
 class ReviewFinding(Base):

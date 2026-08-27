@@ -124,6 +124,28 @@ services:
       redis:
         condition: service_healthy
 
+  # Durable Outbox dispatcher plus queued/running task reconciliation.
+  analysis-maintenance:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: industrial-rag-analysis-maintenance
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://design_review:design_review_local_only@postgres:5432/design_review
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python -m app.workers.analysis_maintenance
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   frontend:
     build:
       context: .

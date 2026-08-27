@@ -38,5 +38,7 @@ export type AnalysisProgress = {
 };
 export type ChatAnswer = {
   answer: string; retrieval_query: string; limitations?: string | null;
-  citations: { chunk_id: string; document_title: string; version: string; page?: number | null; section?: string | null; excerpt: string }[];
+  citations: { chunk_id: string; document_version_id: string; document_title: string; version: string; page?: number | null; section?: string | null; excerpt: string }[];
 };
+export type DocumentChunk = { id: string; chunk_index: number; page: number; section?: string | null; content: string };
+export type DocumentChunkContext = { document_version_id: string; requested_chunk_id: string; chunks: DocumentChunk[] };

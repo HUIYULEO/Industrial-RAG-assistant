@@ -141,6 +141,14 @@ class DocumentChunkResponse(BaseModel):
     content: str
 
 
+class DocumentChunkContextResponse(BaseModel):
+    """The cited passage plus adjacent source passages for in-app reading."""
+
+    document_version_id: str
+    requested_chunk_id: str
+    chunks: list[DocumentChunkResponse]
+
+
 class DocumentFigureResponse(BaseModel):
     id: str
     page: int
