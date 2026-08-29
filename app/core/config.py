@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     # isolated tests; deployed environments should use the Redis default.
     redis_url: str = "redis://localhost:6379/0"
     analysis_queue_name: str = "design-review"
+    document_index_queue_name: str = "document-indexing"
+    document_index_job_timeout_seconds: int = 1800
     analysis_queue_backend: str = "redis"
     analysis_item_max_attempts: int = 3
     analysis_retry_delays_seconds: list[int] = [2, 5]

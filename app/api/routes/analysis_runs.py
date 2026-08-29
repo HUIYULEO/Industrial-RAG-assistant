@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from app.api.auth import require_authenticated_user
-from app.api.dependencies import AnalysisQueueDependency, CurrentUser, DbSession, scoped_review_service
+from app.api.dependencies import CurrentUser, DbSession, scoped_review_service
 from app.api.schemas import (
     AnalysisRunItemResponse,
     AnalysisRunProgressResponse,
@@ -20,8 +20,6 @@ from app.core.config import get_settings
 from app.domain.enums import coverage_status_definition
 from app.domain.models import AnalysisRun, DocumentVersion, ReviewFinding
 from app.repositories.database import get_session_factory
-from app.services.analysis_queue import AnalysisQueue, AnalysisQueueUnavailable
-from app.services.analysis_reliability_service import AnalysisReliabilityService
 from app.services.matrix_export_service import MatrixExportService
 from app.services.review_service import ReviewService
 
@@ -62,18 +60,6 @@ def analysis_progress_response(item: AnalysisRun) -> AnalysisRunProgressResponse
             for value in items
         ],
     )
-
-
-def dispatch_committed_outbox(db, queue: AnalysisQueue) -> None:
-    """Best-effort low-latency kick; the maintenance service guarantees delivery."""
-    reliability = AnalysisReliabilityService(db, get_settings())
-    try:
-        reliability.ensure_pending_dispatches()
-        reliability.dispatch_pending(queue)
-    except AnalysisQueueUnavailable:
-        # The API has already committed the run and its Outbox records. Returning
-        # 202 is correct; maintenance will publish them when Redis is available.
-        return
 
 
 def finding_response(item: ReviewFinding) -> FindingResponse:
@@ -160,12 +146,10 @@ def matrix_row_response(item, findings_by_requirement_id: dict[str, ReviewFindin
 
 
 @router.post("/review-packages/{review_id}/analyses", response_model=AnalysisRunResponse, status_code=status.HTTP_202_ACCEPTED)
-def create_analysis_run(review_id: str, db: DbSession, queue: AnalysisQueueDependency, user: CurrentUser):
+def create_analysis_run(review_id: str, db: DbSession, user: CurrentUser):
     service = scoped_review_service(db, user)
     try:
         item = service.create_analysis_run(review_id)
-        dispatch_committed_outbox(db, queue)
-        item = service.get_analysis_run(item.id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -190,15 +174,17 @@ def get_analysis_run(analysis_run_id: str, db: DbSession, user: CurrentUser):
     return analysis_run_response(item)
 
 
-@router.post("/analysis-runs/{analysis_run_id}/execute", response_model=AnalysisRunResponse)
-def execute_analysis_run(analysis_run_id: str, db: DbSession, queue: AnalysisQueueDependency, user: CurrentUser):
+@router.post(
+    "/analysis-runs/{analysis_run_id}/execute",
+    response_model=AnalysisRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def execute_analysis_run(analysis_run_id: str, db: DbSession, user: CurrentUser):
     service = scoped_review_service(db, user)
     try:
         item = service.get_analysis_run(analysis_run_id)
         if item.status == "completed":
             raise ValueError("Analysis run is already completed")
-        dispatch_committed_outbox(db, queue)
-        item = service.get_analysis_run(analysis_run_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -207,11 +193,10 @@ def execute_analysis_run(analysis_run_id: str, db: DbSession, queue: AnalysisQue
 
 
 @router.post("/analysis-runs/{analysis_run_id}/retry", response_model=AnalysisRunResponse, status_code=status.HTTP_202_ACCEPTED)
-def retry_failed_analysis_items(analysis_run_id: str, db: DbSession, queue: AnalysisQueueDependency, user: CurrentUser):
+def retry_failed_analysis_items(analysis_run_id: str, db: DbSession, user: CurrentUser):
     service = scoped_review_service(db, user)
     try:
         service.retry_failed_analysis_items(analysis_run_id)
-        dispatch_committed_outbox(db, queue)
         item = service.get_analysis_run(analysis_run_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

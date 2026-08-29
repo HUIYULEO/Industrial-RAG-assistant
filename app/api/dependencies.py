@@ -7,32 +7,33 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import require_authenticated_user
 from app.bootstrap.service_factory import (
-    build_document_indexing_service,
     build_document_ingestion_service,
     build_design_review_chat_service,
     build_visual_evidence_service,
     build_visual_interpreter,
 )
 from app.repositories.database import get_db
-from app.services.analysis_queue import AnalysisQueue, get_analysis_queue
 from app.services.auth_service import AuthenticatedUser
 from app.services.design_review_chat_service import DesignReviewChatService
-from app.services.indexing_service import DocumentIndexingService
+from app.services.indexing_service import DocumentIndexSubmissionService
+from app.services.indexing_queue import DocumentIndexQueue, get_document_index_queue
 from app.services.ingestion_service import DocumentIngestionService
 from app.services.review_service import ReviewService
 from app.services.visual_evidence_service import VisualEvidenceService, VisualInterpreter
 
 DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[AuthenticatedUser, Depends(require_authenticated_user)]
-AnalysisQueueDependency = Annotated[AnalysisQueue, Depends(get_analysis_queue)]
+DocumentIndexQueueDependency = Annotated[DocumentIndexQueue, Depends(get_document_index_queue)]
 
 
 def get_document_ingestion_service(db: DbSession) -> DocumentIngestionService:
     return build_document_ingestion_service(db)
 
 
-def get_document_indexing_service(db: DbSession) -> DocumentIndexingService:
-    return build_document_indexing_service(db)
+def get_document_index_submission_service(
+    db: DbSession, queue: DocumentIndexQueueDependency
+) -> DocumentIndexSubmissionService:
+    return DocumentIndexSubmissionService(db, queue)
 
 
 def get_visual_evidence_service(db: DbSession) -> VisualEvidenceService:
@@ -40,7 +41,9 @@ def get_visual_evidence_service(db: DbSession) -> VisualEvidenceService:
 
 
 DocumentIngestionDependency = Annotated[DocumentIngestionService, Depends(get_document_ingestion_service)]
-DocumentIndexingDependency = Annotated[DocumentIndexingService, Depends(get_document_indexing_service)]
+DocumentIndexSubmissionDependency = Annotated[
+    DocumentIndexSubmissionService, Depends(get_document_index_submission_service)
+]
 VisualEvidenceDependency = Annotated[VisualEvidenceService, Depends(get_visual_evidence_service)]
 VisualInterpreterDependency = Annotated[VisualInterpreter, Depends(build_visual_interpreter)]
 DesignReviewChatDependency = Annotated[DesignReviewChatService, Depends(build_design_review_chat_service)]
