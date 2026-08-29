@@ -11,7 +11,7 @@ from app.api.auth import require_authenticated_user
 from app.api.dependencies import (
     CurrentUser,
     DbSession,
-    DocumentIndexingDependency,
+    DocumentIndexSubmissionDependency,
     DocumentIngestionDependency,
     VisualEvidenceDependency,
     VisualInterpreterDependency,
@@ -221,14 +221,19 @@ def analyse_document_figures(
     return [figure_response(item) for item in figures]
 
 
-@router.post("/documents/{document_version_id}/index", response_model=DocumentVersionResponse)
-def index_document(document_version_id: str, indexing: DocumentIndexingDependency):
+@router.post(
+    "/documents/{document_version_id}/index",
+    response_model=DocumentVersionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def index_document(document_version_id: str, indexing: DocumentIndexSubmissionDependency):
     try:
-        item = indexing.index_document_version(document_version_id)
+        item = indexing.queue_document_version(document_version_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        status_code = 409 if "already queued or running" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Document indexing failed: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"Document indexing could not be queued: {exc}") from exc
     return document_response(item)

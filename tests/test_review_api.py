@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 from docx import Document as WordDocument
 from fastapi.testclient import TestClient
-from pypdf import PdfWriter
+from sqlalchemy import select
 
 from app.domain.evidence import EvidenceChunk
 from app.domain.enums import CoverageStatus
-from app.domain.models import AnalysisRun
+from app.domain.models import AnalysisDispatchOutbox, AnalysisRun
 from app.api.auth import require_authenticated_user
 from app.bootstrap.service_factory import build_design_review_chat_service
 from app.repositories import database
@@ -225,9 +225,49 @@ def test_import_requirements_and_create_review_package(review_client: TestClient
     assert analysis.status_code == 202
     assert analysis.json()["status"] == "queued"
 
+    # The HTTP request commits only database work. Redis/RQ publication belongs
+    # to analysis-maintenance, so every Outbox row is still pending here.
+    with database.get_session_factory()() as db:
+        outboxes = list(db.scalars(select(AnalysisDispatchOutbox)))
+        assert len(outboxes) == 2
+        assert all(item.status == "pending" for item in outboxes)
+        assert all(item.job_id is None for item in outboxes)
+
     resumed_runs = review_client.get(f"/review-packages/{review.json()['id']}/analyses")
     assert resumed_runs.status_code == 200
     assert [run["id"] for run in resumed_runs.json()] == [analysis.json()["id"]]
+
+
+def test_document_index_submission_returns_accepted_without_running_embeddings(
+    review_client: TestClient,
+):
+    version_id = create_design_document(review_client)
+    uploaded = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={
+            "file": (
+                "interfaces.csv",
+                b"interface,owner\nWCS API,Automation\n",
+                "text/csv",
+            )
+        },
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["ingestion_status"] == "parsed_pending_index"
+
+    queued = review_client.post(f"/documents/{version_id}/index")
+
+    assert queued.status_code == 202
+    assert queued.json()["ingestion_status"] == "index_queued"
+    assert queued.json()["ingestion_error"] is None
+    persisted = next(
+        item for item in review_client.get("/documents").json() if item["id"] == version_id
+    )
+    assert persisted["ingestion_status"] == "index_queued"
+
+    duplicate = review_client.post(f"/documents/{version_id}/index")
+    assert duplicate.status_code == 409
+    assert "already queued or running" in duplicate.json()["detail"]
 
 
 def test_progress_reconciles_a_stale_run_after_all_items_settle(review_client: TestClient):
@@ -480,12 +520,14 @@ def test_document_replacement_preserves_logical_document(review_client: TestClie
 
 
 def test_pdf_upload_rejects_non_extractable_document(review_client: TestClient, tmp_path: Path):
+    import fitz
+
     version_id = create_design_document(review_client)
-    writer = PdfWriter()
-    writer.add_blank_page(width=72, height=72)
     pdf_path = tmp_path / "empty.pdf"
-    with pdf_path.open("wb") as handle:
-        writer.write(handle)
+    document = fitz.open()
+    document.new_page(width=72, height=72)
+    document.save(pdf_path)
+    document.close()
 
     response = review_client.post(
         f"/documents/{version_id}/upload",
@@ -495,28 +537,26 @@ def test_pdf_upload_rejects_non_extractable_document(review_client: TestClient, 
     assert "No extractable text" in response.json()["detail"]
 
 
-def test_encrypted_pdf_requires_and_accepts_a_one_time_password(review_client: TestClient):
+def test_encrypted_pdf_requires_and_accepts_a_one_time_password(review_client: TestClient, tmp_path: Path):
     import fitz
-    from pypdf import PdfReader
 
     source = fitz.open()
     page = source.new_page()
     page.insert_text((72, 72), "4.1 Task dispatch\nThe system retains task dispatch records for audit.")
-    readable_pdf = source.tobytes()
+    encrypted_path = tmp_path / "protected.pdf"
+    source.save(
+        encrypted_path,
+        encryption=fitz.PDF_ENCRYPT_AES_256,
+        owner_pw="supplier-owner-password",
+        user_pw="supplier-password",
+    )
     source.close()
-
-    writer = PdfWriter()
-    reader = PdfReader(BytesIO(readable_pdf))
-    for page in reader.pages:
-        writer.add_page(page)
-    writer.encrypt("supplier-password", algorithm="AES-256")
-    encrypted_pdf = BytesIO()
-    writer.write(encrypted_pdf)
+    encrypted_pdf = encrypted_path.read_bytes()
 
     missing_password_version = create_design_document(review_client)
     missing_password = review_client.post(
         f"/documents/{missing_password_version}/upload",
-        files={"file": ("protected.pdf", encrypted_pdf.getvalue(), "application/pdf")},
+        files={"file": ("protected.pdf", encrypted_pdf, "application/pdf")},
     )
     assert missing_password.status_code == 400
     assert "Enter its password" in missing_password.json()["detail"]
@@ -524,7 +564,7 @@ def test_encrypted_pdf_requires_and_accepts_a_one_time_password(review_client: T
     password_version = create_design_document(review_client)
     accepted = review_client.post(
         f"/documents/{password_version}/upload",
-        files={"file": ("protected.pdf", encrypted_pdf.getvalue(), "application/pdf")},
+        files={"file": ("protected.pdf", encrypted_pdf, "application/pdf")},
         data={"pdf_password": "supplier-password"},
     )
     assert accepted.status_code == 200

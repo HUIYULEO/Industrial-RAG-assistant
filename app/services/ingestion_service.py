@@ -9,10 +9,10 @@ from io import BytesIO, StringIO
 from dataclasses import dataclass
 from pathlib import Path
 
+import fitz
 from docx import Document as WordDocument
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from pypdf import PdfReader
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -28,7 +28,7 @@ DEFAULT_CHUNK_SIZE = 2_200
 # Citable passages are also read by people. Duplicating the end of one passage
 # at the start of the next made the source reader look like a damaged copy of
 # the original document, so chunks deliberately do not overlap.
-DEFAULT_CHUNK_OVERLAP = 0
+DEFAULT_CHUNK_OVERLAP = 200
 
 
 @dataclass(frozen=True)
@@ -236,34 +236,48 @@ class DocumentIngestionService:
         return self._parse_csv(path)
 
     def _parse_pdf(self, path: Path, *, pdf_password: str | None = None) -> tuple[list[ParsedChunk], int]:
-        reader = PdfReader(str(path))
-        if reader.is_encrypted:
-            if not reader.decrypt(pdf_password or ""):
-                if pdf_password:
-                    raise ValueError("The PDF password is incorrect or cannot open this encrypted PDF")
-                raise ValueError("This PDF is encrypted. Enter its password to parse it; the password is not stored")
-        if not reader.pages:
-            raise ValueError("PDF contains no pages")
+        """Extract text blocks with PyMuPDF while retaining their page order.
 
-        chunks: list[ParsedChunk] = []
-        current_section: str | None = None
-        for page_number, page in enumerate(reader.pages, start=1):
-            # The layout mode retains paragraph breaks, indentation and table
-            # spacing where the PDF exposes them. The plain extractor is kept
-            # as a compatibility fallback for PDFs whose producer metadata is
-            # incomplete.
-            try:
-                page_text = page.extract_text(extraction_mode="layout") or ""
-            except Exception:
-                page_text = page.extract_text() or ""
-            page_text = self._preserve_pdf_layout(page_text)
-            if not page_text:
+        PyMuPDF gives us page-local text blocks and coordinates instead of a
+        single producer-dependent text stream.  We currently persist the
+        page/section anchor; keeping block boundaries here also prevents text
+        from unrelated visual regions being concatenated into one paragraph.
+        """
+        with fitz.open(str(path)) as document:
+            if document.needs_pass:
+                if not document.authenticate(pdf_password or ""):
+                    if pdf_password:
+                        raise ValueError("The PDF password is incorrect or cannot open this encrypted PDF")
+                    raise ValueError("This PDF is encrypted. Enter its password to parse it; the password is not stored")
+            if document.page_count == 0:
+                raise ValueError("PDF contains no pages")
+
+            chunks: list[ParsedChunk] = []
+            current_section: str | None = None
+            for page_number, page in enumerate(document, start=1):
+                page_text = self._extract_pdf_text_blocks(page)
+                if not page_text:
+                    continue
+                page_chunks, current_section = self._chunk_page(page_text, page_number, current_section)
+                chunks.extend(page_chunks)
+
+            if not chunks:
+                raise ValueError("No extractable text found; OCR is required for this scanned PDF")
+            return chunks, document.page_count
+
+    def _extract_pdf_text_blocks(self, page: fitz.Page) -> str:
+        """Return text blocks in visual order, excluding non-text image blocks."""
+        text_blocks: list[str] = []
+        for block in page.get_text("blocks", sort=True):
+            # ``blocks`` is (x0, y0, x1, y1, text, block_no, block_type).
+            # Block type 0 is text; image blocks must not become accidental
+            # evidence merely because their metadata is available.
+            if block[6] != 0:
                 continue
-            page_chunks, current_section = self._chunk_page(page_text, page_number, current_section)
-            chunks.extend(page_chunks)
-        if not chunks:
-            raise ValueError("No extractable text found; OCR is required for this scanned PDF")
-        return chunks, len(reader.pages)
+            text = self._preserve_pdf_layout(block[4])
+            if text:
+                text_blocks.append(text)
+        return "\n\n".join(text_blocks)
 
     def _parse_docx(self, path: Path) -> tuple[list[ParsedChunk], int]:
         document = WordDocument(str(path))

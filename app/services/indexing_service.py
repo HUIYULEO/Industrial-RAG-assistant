@@ -7,12 +7,73 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from time import monotonic, sleep
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.domain.models import DocumentChunk, DocumentVersion
 from app.domain.ports import DocumentChunkIndex
 from app.services.embedding_service import EmbeddingService
+from app.services.indexing_queue import DocumentIndexQueue
+
+
+INDEX_QUEUEABLE_STATUSES = {"parsed_pending_index", "index_failed"}
+INDEX_ACTIVE_STATUSES = {"index_queued", "indexing"}
+
+
+class DocumentIndexSubmissionService:
+    """Persist an indexing request before handing it to the background queue."""
+
+    def __init__(self, db: Session, queue: DocumentIndexQueue):
+        self.db = db
+        self.queue = queue
+
+    def queue_document_version(self, document_version_id: str) -> DocumentVersion:
+        version = self.db.scalar(
+            select(DocumentVersion)
+            .options(selectinload(DocumentVersion.document), selectinload(DocumentVersion.chunks))
+            .where(DocumentVersion.id == document_version_id)
+        )
+        if version is None:
+            raise LookupError("Document version not found")
+        if not version.chunks:
+            raise ValueError("Document must be parsed before it can be indexed")
+        if version.ingestion_status in INDEX_ACTIVE_STATUSES:
+            raise ValueError("Document indexing is already queued or running")
+        if version.ingestion_status not in INDEX_QUEUEABLE_STATUSES:
+            raise ValueError("Document must be parsed again before a new index can be created")
+
+        # The conditional update makes two simultaneous submissions collapse to
+        # one durable queued state before either caller can publish to Redis.
+        claimed = self.db.execute(
+            update(DocumentVersion)
+            .where(
+                DocumentVersion.id == document_version_id,
+                DocumentVersion.ingestion_status.in_(INDEX_QUEUEABLE_STATUSES),
+            )
+            .values(ingestion_status="index_queued", ingestion_error=None)
+        )
+        if claimed.rowcount != 1:
+            self.db.rollback()
+            raise ValueError("Document indexing is already queued or running")
+        self.db.commit()
+        self.db.refresh(version)
+
+        try:
+            self.queue.enqueue(document_version_id)
+        except Exception as exc:
+            # A queued status must always mean that executable work exists.
+            self.db.execute(
+                update(DocumentVersion)
+                .where(
+                    DocumentVersion.id == document_version_id,
+                    DocumentVersion.ingestion_status == "index_queued",
+                )
+                .values(ingestion_status="index_failed", ingestion_error=str(exc))
+            )
+            self.db.commit()
+            self.db.refresh(version)
+            raise
+        return version
 
 
 @dataclass(frozen=True)
@@ -70,9 +131,24 @@ class DocumentIndexingService:
         if not version.chunks:
             raise ValueError("Document must be parsed before it can be indexed")
 
-        version.ingestion_status = "indexing"
-        version.ingestion_error = None
+        claimed = self.db.execute(
+            update(DocumentVersion)
+            .where(
+                DocumentVersion.id == document_version_id,
+                DocumentVersion.ingestion_status == "index_queued",
+            )
+            .values(ingestion_status="indexing", ingestion_error=None)
+        )
+        if claimed.rowcount != 1:
+            self.db.rollback()
+            self.db.refresh(version)
+            if version.ingestion_status in {"indexing", "indexed"}:
+                # A duplicate/stale RQ delivery must not embed or overwrite the
+                # same document a second time.
+                return version
+            raise ValueError("Document indexing job is not in the queued state")
         self.db.commit()
+        self.db.refresh(version)
         try:
             chunks = sorted(version.chunks, key=lambda item: item.chunk_index)
             vectors = self._embed_texts([chunk.content for chunk in chunks])
