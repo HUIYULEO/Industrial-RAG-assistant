@@ -4,10 +4,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from starlette.concurrency import run_in_threadpool
 
-from app.api.auth import require_authenticated_user
+from app.api.auth import require_admin_user, require_authenticated_user
 from app.api.dependencies import (
     CurrentUser,
     DbSession,
@@ -26,13 +26,19 @@ from app.api.schemas import (
     DocumentVersionResponse,
 )
 from app.core.config import get_settings
-from app.domain.models import ReviewPackageDocument
+from app.core.logging_config import get_logger
 from app.services.review_service import ReviewService
 
 router = APIRouter(tags=["documents"], dependencies=[Depends(require_authenticated_user)])
+logger = get_logger(__name__)
 
 
-@router.post("/documents", response_model=DocumentVersionResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/documents",
+    response_model=DocumentVersionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin_user)],
+)
 def create_document(payload: DocumentCreate, db: DbSession):
     service = ReviewService(db)
     try:
@@ -61,7 +67,11 @@ def list_documents(db: DbSession):
     return [document_response(item) for item in ReviewService(db).list_document_versions()]
 
 
-@router.post("/documents/{document_version_id}/archive", response_model=DocumentVersionResponse)
+@router.post(
+    "/documents/{document_version_id}/archive",
+    response_model=DocumentVersionResponse,
+    dependencies=[Depends(require_admin_user)],
+)
 def archive_document(document_version_id: str, payload: DocumentArchiveRequest, db: DbSession, user: CurrentUser):
     try:
         item = ReviewService(db).archive_document_version(
@@ -76,21 +86,29 @@ def archive_document(document_version_id: str, payload: DocumentArchiveRequest, 
     return document_response(item)
 
 
-@router.post("/documents/{document_version_id}/upload", response_model=DocumentVersionResponse)
+@router.post(
+    "/documents/{document_version_id}/upload",
+    response_model=DocumentVersionResponse,
+    dependencies=[Depends(require_admin_user)],
+)
 async def upload_document(
     document_version_id: str,
-    db: DbSession,
     ingestion: DocumentIngestionDependency,
     file: UploadFile = File(...),
     pdf_password: str | None = Form(default=None),
 ):
     settings = get_settings()
-    content = await file.read()
-    if len(content) > settings.max_upload_size_mb * 1024 * 1024:
+    max_upload_bytes = settings.max_upload_size_mb * 1024 * 1024
+    content = await file.read(max_upload_bytes + 1)
+    if len(content) > max_upload_bytes:
         raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_size_mb} MB limit")
     try:
-        item = ingestion.upload_and_parse(
-            document_version_id, file.filename or "", content, pdf_password=pdf_password
+        item = await run_in_threadpool(
+            ingestion.upload_and_parse,
+            document_version_id,
+            file.filename or "",
+            content,
+            pdf_password=pdf_password,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -99,16 +117,17 @@ async def upload_document(
     return document_response(item)
 
 
-@router.post("/documents/{document_version_id}/reparse", response_model=DocumentVersionResponse)
+@router.post(
+    "/documents/{document_version_id}/reparse",
+    response_model=DocumentVersionResponse,
+    dependencies=[Depends(require_admin_user)],
+)
 def reparse_document(
     document_version_id: str,
-    db: DbSession,
     ingestion: DocumentIngestionDependency,
     pdf_password: str | None = Form(default=None),
 ):
     try:
-        if db.scalar(select(ReviewPackageDocument.id).where(ReviewPackageDocument.document_version_id == document_version_id)):
-            raise ValueError("A document version in a frozen Review Package cannot be reparsed")
         item = ingestion.reparse_stored_document(
             document_version_id, pdf_password=pdf_password
         )
@@ -131,6 +150,8 @@ def list_document_chunks(document_version_id: str, ingestion: DocumentIngestionD
             chunk_index=chunk.chunk_index,
             page=chunk.page,
             section=chunk.section,
+            element_type=chunk.element_type,
+            source_metadata=chunk.source_metadata,
             content=chunk.content,
         )
         for chunk in chunks
@@ -158,6 +179,8 @@ def read_document_chunk_context(
                 chunk_index=chunk.chunk_index,
                 page=chunk.page,
                 section=chunk.section,
+                element_type=chunk.element_type,
+                source_metadata=chunk.source_metadata,
                 content=chunk.content,
             )
             for chunk in chunks
@@ -198,7 +221,11 @@ def get_document_figure_asset(document_version_id: str, figure_id: str, visual_e
     return FileResponse(image_path, media_type="image/png", filename=f"visual-evidence-page-{figure.page}.png")
 
 
-@router.post("/documents/{document_version_id}/figures/analyse", response_model=list[DocumentFigureResponse])
+@router.post(
+    "/documents/{document_version_id}/figures/analyse",
+    response_model=list[DocumentFigureResponse],
+    dependencies=[Depends(require_admin_user)],
+)
 def analyse_document_figures(
     document_version_id: str,
     visual_evidence: VisualEvidenceDependency,
@@ -217,7 +244,13 @@ def analyse_document_figures(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Visual analysis failed: {exc}") from exc
+        logger.exception(
+            "Visual analysis failed for document %s", document_version_id
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Visual analysis is temporarily unavailable.",
+        ) from exc
     return [figure_response(item) for item in figures]
 
 
@@ -225,6 +258,7 @@ def analyse_document_figures(
     "/documents/{document_version_id}/index",
     response_model=DocumentVersionResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin_user)],
 )
 def index_document(document_version_id: str, indexing: DocumentIndexSubmissionDependency):
     try:
@@ -235,5 +269,11 @@ def index_document(document_version_id: str, indexing: DocumentIndexSubmissionDe
         status_code = 409 if "already queued or running" in str(exc) else 400
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Document indexing could not be queued: {exc}") from exc
+        logger.exception(
+            "Document indexing submission failed for document %s", document_version_id
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Document indexing is temporarily unavailable.",
+        ) from exc
     return document_response(item)

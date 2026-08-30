@@ -4,11 +4,13 @@ import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.api.auth import require_authenticated_user
 from app.api.dependencies import CurrentUser, DbSession, scoped_review_service
 from app.api.schemas import (
     AnalysisRunItemResponse,
+    AnalysisRunCreate,
     AnalysisRunProgressResponse,
     AnalysisRunResponse,
     AuditPointResponse,
@@ -31,6 +33,8 @@ def analysis_run_response(item: AnalysisRun) -> AnalysisRunResponse:
         id=item.id,
         review_package_id=item.review_package_id,
         status=item.status,
+        strategy=item.strategy,
+        strategy_version=item.strategy_version,
         error_message=item.error_message,
         created_at=item.created_at,
         completed_at=item.completed_at,
@@ -60,6 +64,16 @@ def analysis_progress_response(item: AnalysisRun) -> AnalysisRunProgressResponse
             for value in items
         ],
     )
+
+
+def _load_analysis_progress(analysis_run_id: str, user: CurrentUser) -> AnalysisRunProgressResponse:
+    session = get_session_factory()()
+    try:
+        return analysis_progress_response(
+            scoped_review_service(session, user).get_analysis_run(analysis_run_id)
+        )
+    finally:
+        session.close()
 
 
 def finding_response(item: ReviewFinding) -> FindingResponse:
@@ -146,10 +160,15 @@ def matrix_row_response(item, findings_by_requirement_id: dict[str, ReviewFindin
 
 
 @router.post("/review-packages/{review_id}/analyses", response_model=AnalysisRunResponse, status_code=status.HTTP_202_ACCEPTED)
-def create_analysis_run(review_id: str, db: DbSession, user: CurrentUser):
+def create_analysis_run(
+    review_id: str,
+    db: DbSession,
+    user: CurrentUser,
+    payload: AnalysisRunCreate | None = None,
+):
     service = scoped_review_service(db, user)
     try:
-        item = service.create_analysis_run(review_id)
+        item = service.create_analysis_run(review_id, strategy=(payload or AnalysisRunCreate()).strategy)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -215,25 +234,20 @@ def get_analysis_run_progress(analysis_run_id: str, db: DbSession, user: Current
 
 @router.get("/analysis-runs/{analysis_run_id}/events")
 async def stream_analysis_run_progress(
-    analysis_run_id: str, request: Request, db: DbSession, user: CurrentUser
+    analysis_run_id: str, request: Request, user: CurrentUser
 ):
     try:
-        analysis_progress_response(scoped_review_service(db, user).get_analysis_run(analysis_run_id))
+        await run_in_threadpool(_load_analysis_progress, analysis_run_id, user)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    poll_seconds = get_settings().analysis_progress_poll_seconds
 
     async def events():
         previous_payload: str | None = None
         terminal = {"completed", "failed"}
         while not await request.is_disconnected():
-            session = get_session_factory()()
-            try:
-                progress = analysis_progress_response(
-                    scoped_review_service(session, user).get_analysis_run(analysis_run_id)
-                )
-                payload = progress.model_dump_json()
-            finally:
-                session.close()
+            progress = await run_in_threadpool(_load_analysis_progress, analysis_run_id, user)
+            payload = progress.model_dump_json()
             if payload != previous_payload:
                 yield f"event: progress\ndata: {payload}\n\n"
                 previous_payload = payload
@@ -241,7 +255,7 @@ async def stream_analysis_run_progress(
                 yield f"event: complete\ndata: {payload}\n\n"
                 return
             yield ": heartbeat\n\n"
-            await asyncio.sleep(get_settings().analysis_progress_poll_seconds)
+            await asyncio.sleep(poll_seconds)
 
     return StreamingResponse(
         events(),

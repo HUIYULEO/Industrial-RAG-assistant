@@ -167,6 +167,98 @@ def test_outbox_remains_pending_when_redis_is_unavailable(tmp_path):
     db.close()
 
 
+def test_lease_recovery_finishes_the_running_historical_attempt_after_manual_retry(tmp_path):
+    engine = database(tmp_path)
+    db = Session(engine)
+    item = create_item(db, status="running")
+    item.attempt_count = 1
+    item.lease_owner = "worker-new-cycle"
+    item.lease_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.add_all(
+        [
+            AnalysisAttempt(
+                analysis_run_item_id=item.id,
+                attempt_number=attempt_number,
+                worker_id="worker-old-cycle",
+                status="failed",
+            )
+            for attempt_number in range(1, 4)
+        ]
+        + [
+            AnalysisAttempt(
+                analysis_run_item_id=item.id,
+                attempt_number=4,
+                worker_id="worker-new-cycle",
+                status="running",
+            )
+        ]
+    )
+    db.commit()
+
+    recovered = AnalysisReliabilityService(db, settings()).recover_expired_leases()
+    db.expire_all()
+    attempts = list(
+        db.scalars(
+            select(AnalysisAttempt)
+            .where(AnalysisAttempt.analysis_run_item_id == item.id)
+            .order_by(AnalysisAttempt.attempt_number)
+        )
+    )
+
+    assert recovered == 1
+    assert db.get(AnalysisRunItem, item.id).status == "queued"
+    assert [attempt.status for attempt in attempts] == ["failed", "failed", "failed", "timed_out"]
+    db.close()
+
+
+def test_worker_initialization_failure_is_terminal_for_matching_dispatch(tmp_path):
+    engine = database(tmp_path)
+    db = Session(engine)
+    item = create_item(db)
+    item.job_id = analysis_job_id(item.id, 0)
+    db.commit()
+    reliability = AnalysisReliabilityService(db, settings())
+
+    marked = reliability.fail_worker_initialization(
+        item.id, 0, RuntimeError("provider configuration is invalid")
+    )
+    queue = FakeQueue()
+    maintenance = reliability.tick(queue)
+    db.expire_all()
+    persisted = db.get(AnalysisRunItem, item.id)
+
+    assert marked is True
+    assert persisted.status == "failed"
+    assert persisted.job_id is None
+    assert "Worker initialization failed (RuntimeError)" in persisted.error_message
+    assert db.get(AnalysisRun, persisted.analysis_run_id).status == "failed"
+    assert maintenance == {
+        "expired_leases": 0,
+        "stale_jobs": 0,
+        "backfilled_outbox": 0,
+        "dispatched": 0,
+    }
+    assert queue.dispatches == []
+    db.close()
+
+
+def test_worker_initialization_failure_does_not_mutate_a_newer_dispatch(tmp_path):
+    engine = database(tmp_path)
+    db = Session(engine)
+    item = create_item(db)
+    item.dispatch_version = 2
+    db.commit()
+
+    marked = AnalysisReliabilityService(db, settings()).fail_worker_initialization(
+        item.id, 1, RuntimeError("stale worker")
+    )
+    db.expire_all()
+
+    assert marked is False
+    assert db.get(AnalysisRunItem, item.id).status == "queued"
+    db.close()
+
+
 def test_permanent_dispatch_error_is_blocked_after_one_attempt(tmp_path):
     engine = database(tmp_path)
     db = Session(engine)
@@ -249,7 +341,7 @@ def test_real_rq_path_classifies_invalid_job_id_as_permanent(monkeypatch):
         def exists(self, _key):
             return 0
 
-    monkeypatch.setattr(Redis, "from_url", staticmethod(lambda _url: FakeRedis()))
+    monkeypatch.setattr(Redis, "from_url", staticmethod(lambda _url, **_kwargs: FakeRedis()))
     dispatch = AnalysisDispatch(
         item_id="item-1",
         dispatch_version=0,
@@ -266,7 +358,39 @@ def test_redis_connection_failure_is_classified_as_transient(monkeypatch):
         def ping(self):
             raise RedisConnectionError("connection refused")
 
-    monkeypatch.setattr(Redis, "from_url", staticmethod(lambda _url: UnreachableRedis()))
+    monkeypatch.setattr(Redis, "from_url", staticmethod(lambda _url, **_kwargs: UnreachableRedis()))
 
     with pytest.raises(AnalysisQueueTransientError, match="temporarily unavailable"):
         RedisAnalysisQueue(settings()).enqueue_dispatches([])
+
+
+def test_redis_queue_uses_short_timeouts_and_reuses_its_client(monkeypatch):
+    calls: list[tuple[str, dict[str, int]]] = []
+
+    class FakeRedis:
+        def __init__(self):
+            self.pings = 0
+
+        def ping(self):
+            self.pings += 1
+            return True
+
+    connection = FakeRedis()
+
+    def from_url(url, **kwargs):
+        calls.append((url, kwargs))
+        return connection
+
+    monkeypatch.setattr(Redis, "from_url", staticmethod(from_url))
+    queue = RedisAnalysisQueue(settings())
+
+    queue.enqueue_dispatches([])
+    queue.stale_item_ids({})
+
+    assert calls == [
+        (
+            settings().redis_url,
+            {"socket_connect_timeout": 1, "socket_timeout": 1},
+        )
+    ]
+    assert connection.pings == 1

@@ -6,11 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.auth import require_authenticated_user
-from app.api.dependencies import CurrentUser, DbSession, DesignReviewChatDependency, scoped_review_service
+from app.api.dependencies import CurrentUser, DesignReviewChatDependency, scoped_review_service
 from app.api.schemas import ReviewChatCitation, ReviewChatRequest, ReviewChatResponse
+from app.core.logging_config import get_logger
+from app.repositories.database import get_session_factory
 from app.services.design_review_chat_service import GroundedAnswer
 
 router = APIRouter(tags=["evidence-chat"], dependencies=[Depends(require_authenticated_user)])
+logger = get_logger(__name__)
 
 
 def citation_response(item) -> ReviewChatCitation:
@@ -39,20 +42,32 @@ def sse_event(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _load_review_scope(review_package_id: str, user: CurrentUser) -> tuple[str, list[str]]:
+    db = get_session_factory()()
+    try:
+        review = scoped_review_service(db, user).get_review_package(review_package_id)
+        return review.system, [
+            link.document_version_id for link in review.document_links
+        ]
+    finally:
+        db.close()
+
+
 @router.post("/design-review/chat", response_model=ReviewChatResponse)
 def design_review_chat(
     payload: ReviewChatRequest,
-    db: DbSession,
     user: CurrentUser,
     chat: DesignReviewChatDependency,
 ):
     """Ask Chinese or English questions against only one frozen review scope."""
     try:
-        review = scoped_review_service(db, user).get_review_package(payload.review_package_id)
+        system, document_version_ids = _load_review_scope(
+            payload.review_package_id, user
+        )
         answer, citations, retrieval_query = chat.answer(
             question=payload.question,
-            document_version_ids=[link.document_version_id for link in review.document_links],
-            system=review.system,
+            document_version_ids=document_version_ids,
+            system=system,
             conversation_history=[(message.role, message.content) for message in payload.conversation_history],
         )
     except LookupError as exc:
@@ -60,20 +75,27 @@ def design_review_chat(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Design review chat failed: {exc}") from exc
+        logger.exception(
+            "Design review chat failed for review package %s", payload.review_package_id
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The evidence answer could not be generated.",
+        ) from exc
     return chat_response(answer=answer, citations=citations, retrieval_query=retrieval_query)
 
 
 @router.post("/design-review/chat/stream")
 def stream_design_review_chat(
     payload: ReviewChatRequest,
-    db: DbSession,
     user: CurrentUser,
     chat: DesignReviewChatDependency,
 ):
     """Stream evidence-chat text; send citations only after the answer finishes."""
     try:
-        review = scoped_review_service(db, user).get_review_package(payload.review_package_id)
+        system, document_version_ids = _load_review_scope(
+            payload.review_package_id, user
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -85,8 +107,8 @@ def stream_design_review_chat(
             yield sse_event("status", {"phase": "retrieving"})
             prepared = chat.prepare(
                 question=payload.question,
-                document_version_ids=[link.document_version_id for link in review.document_links],
-                system=review.system,
+                document_version_ids=document_version_ids,
+                system=system,
                 conversation_history=history,
             )
             yield sse_event("status", {"phase": "answering"})
@@ -113,6 +135,10 @@ def stream_design_review_chat(
         except ValueError as exc:
             yield sse_event("error", {"detail": str(exc)})
         except Exception:
+            logger.exception(
+                "Streaming design review chat failed for review package %s",
+                payload.review_package_id,
+            )
             yield sse_event("error", {"detail": "The evidence answer could not be generated."})
 
     return StreamingResponse(

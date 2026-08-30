@@ -54,9 +54,20 @@ def initialise_database() -> None:
             "archived_at": "TIMESTAMP WITH TIME ZONE",
             "archived_by_user_id": "VARCHAR(36)",
             "archived_reason": "TEXT",
+            "index_dispatch_version": "INTEGER NOT NULL DEFAULT 0",
+            "index_job_id": "VARCHAR(160)",
+            "index_started_at": "TIMESTAMP WITH TIME ZONE",
         },
         "review_findings": {
             "audit_points": "JSON",
+        },
+        "document_chunks": {
+            "element_type": "VARCHAR(40) NOT NULL DEFAULT 'text'",
+            "source_metadata": "JSON",
+        },
+        "analysis_runs": {
+            "strategy": "VARCHAR(30) NOT NULL DEFAULT 'decomposed'",
+            "strategy_version": "VARCHAR(30) NOT NULL DEFAULT 'decomposed-v2'",
         },
         "users": {
             "organization_id": "VARCHAR(36)",
@@ -70,6 +81,7 @@ def initialise_database() -> None:
             "lease_owner": "VARCHAR(160)",
             "lease_expires_at": "TIMESTAMP WITH TIME ZONE",
             "heartbeat_at": "TIMESTAMP WITH TIME ZONE",
+            "analysis_trace": "JSON",
         },
     }
     inspector = inspect(engine)

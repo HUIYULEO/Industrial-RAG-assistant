@@ -29,13 +29,16 @@ class MilvusChunkRepository:
         if len(version_ids) != 1:
             raise ValueError("Each indexing operation must contain exactly one document version")
         client = self._client()
-        self._ensure_collection(client)
-        version_id = next(iter(version_ids))
-        client.delete(
-            collection_name=self.collection_name,
-            filter=f'document_version_id == "{self._escape_filter_value(version_id)}"',
-        )
-        client.insert(collection_name=self.collection_name, data=list(records))
+        try:
+            self._ensure_collection(client)
+            version_id = next(iter(version_ids))
+            client.delete(
+                collection_name=self.collection_name,
+                filter=f'document_version_id == "{self._escape_filter_value(version_id)}"',
+            )
+            client.insert(collection_name=self.collection_name, data=list(records))
+        finally:
+            client.close()
 
     def hybrid_search(
         self,
@@ -49,62 +52,65 @@ class MilvusChunkRepository:
         from pymilvus import AnnSearchRequest, RRFRanker
 
         client = self._client()
-        self._ensure_collection(client)
-        expression = self._filter_expression(filters)
-        candidate_limit = max(limit * 3, 15)
-        dense_request = AnnSearchRequest(
-            data=[query_vector],
-            anns_field="dense_vector",
-            param={"metric_type": "COSINE"},
-            limit=candidate_limit,
-            expr=expression,
-        )
-        sparse_request = AnnSearchRequest(
-            data=[query_text],
-            anns_field="sparse_vector",
-            param={"metric_type": "BM25"},
-            limit=candidate_limit,
-            expr=expression,
-        )
-        results = client.hybrid_search(
-            collection_name=self.collection_name,
-            reqs=[dense_request, sparse_request],
-            ranker=RRFRanker(),
-            limit=limit,
-            output_fields=[
-                "chunk_id",
-                "document_version_id",
-                "document_title",
-                "document_type",
-                "version",
-                "page",
-                "section",
-                "content",
-            ],
-        )
-        evidence: list[EvidenceChunk] = []
-        for hits in results:
-            for hit in hits:
-                entity = hit["entity"]
-                # MilvusClient 2.6 returns the primary key under its schema
-                # field name (chunk_id), not the legacy generic "id" key.
-                chunk_id = hit.get("chunk_id") or entity.get("chunk_id")
-                if not chunk_id:
-                    raise ValueError("Milvus search result is missing the chunk_id primary key")
-                evidence.append(
-                    EvidenceChunk(
-                        chunk_id=str(chunk_id),
-                        document_version_id=entity["document_version_id"],
-                        document_title=entity["document_title"],
-                        document_type=entity["document_type"],
-                        version=entity["version"],
-                        page=entity.get("page"),
-                        section=entity.get("section") or None,
-                        content=entity["content"],
-                        fused_score=float(hit["distance"]),
+        try:
+            self._ensure_collection(client)
+            expression = self._filter_expression(filters)
+            candidate_limit = max(limit * 3, 15)
+            dense_request = AnnSearchRequest(
+                data=[query_vector],
+                anns_field="dense_vector",
+                param={"metric_type": "COSINE"},
+                limit=candidate_limit,
+                expr=expression,
+            )
+            sparse_request = AnnSearchRequest(
+                data=[query_text],
+                anns_field="sparse_vector",
+                param={"metric_type": "BM25"},
+                limit=candidate_limit,
+                expr=expression,
+            )
+            results = client.hybrid_search(
+                collection_name=self.collection_name,
+                reqs=[dense_request, sparse_request],
+                ranker=RRFRanker(),
+                limit=limit,
+                output_fields=[
+                    "chunk_id",
+                    "document_version_id",
+                    "document_title",
+                    "document_type",
+                    "version",
+                    "page",
+                    "section",
+                    "content",
+                ],
+            )
+            evidence: list[EvidenceChunk] = []
+            for hits in results:
+                for hit in hits:
+                    entity = hit["entity"]
+                    # MilvusClient 2.6 returns the primary key under its schema
+                    # field name (chunk_id), not the legacy generic "id" key.
+                    chunk_id = hit.get("chunk_id") or entity.get("chunk_id")
+                    if not chunk_id:
+                        raise ValueError("Milvus search result is missing the chunk_id primary key")
+                    evidence.append(
+                        EvidenceChunk(
+                            chunk_id=str(chunk_id),
+                            document_version_id=entity["document_version_id"],
+                            document_title=entity["document_title"],
+                            document_type=entity["document_type"],
+                            version=entity["version"],
+                            page=entity.get("page"),
+                            section=entity.get("section") or None,
+                            content=entity["content"],
+                            fused_score=float(hit["distance"]),
+                        )
                     )
-                )
-        return evidence
+            return evidence
+        finally:
+            client.close()
 
     def _client(self):
         from pymilvus import MilvusClient

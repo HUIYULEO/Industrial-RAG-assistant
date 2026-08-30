@@ -16,24 +16,20 @@ from app.repositories.database import get_db
 from app.services.auth_service import AuthenticatedUser
 from app.services.design_review_chat_service import DesignReviewChatService
 from app.services.indexing_service import DocumentIndexSubmissionService
-from app.services.indexing_queue import DocumentIndexQueue, get_document_index_queue
 from app.services.ingestion_service import DocumentIngestionService
 from app.services.review_service import ReviewService
 from app.services.visual_evidence_service import VisualEvidenceService, VisualInterpreter
 
-DbSession = Annotated[Session, Depends(get_db)]
+DbSession = Annotated[Session, Depends(get_db, scope="function")]
 CurrentUser = Annotated[AuthenticatedUser, Depends(require_authenticated_user)]
-DocumentIndexQueueDependency = Annotated[DocumentIndexQueue, Depends(get_document_index_queue)]
 
 
 def get_document_ingestion_service(db: DbSession) -> DocumentIngestionService:
     return build_document_ingestion_service(db)
 
 
-def get_document_index_submission_service(
-    db: DbSession, queue: DocumentIndexQueueDependency
-) -> DocumentIndexSubmissionService:
-    return DocumentIndexSubmissionService(db, queue)
+def get_document_index_submission_service(db: DbSession) -> DocumentIndexSubmissionService:
+    return DocumentIndexSubmissionService(db)
 
 
 def get_visual_evidence_service(db: DbSession) -> VisualEvidenceService:

@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import socket
 import threading
 
 from app.bootstrap.service_factory import build_coverage_analysis_service
 from app.core.config import get_settings
+from app.core.logging_config import get_logger
 from app.domain.analysis import CURRENT_ANALYSIS_TASK_SCHEMA_VERSION
-from app.repositories.database import get_session_factory, initialise_database
+from app.repositories.database import get_session_factory
 from app.services.analysis_reliability_service import AnalysisReliabilityService
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _heartbeat_loop(
@@ -48,7 +48,6 @@ def execute_analysis_item(
     task_schema_version: int = CURRENT_ANALYSIS_TASK_SCHEMA_VERSION,
 ) -> None:
     """Execute and persist one independently retryable analysis item."""
-    initialise_database()
     db = get_session_factory()()
     try:
         settings = get_settings()
@@ -60,6 +59,30 @@ def execute_analysis_item(
             )
             return
         worker_id = f"{socket.gethostname()}:{os.getpid()}:{settings.worker_build_version}"
+        try:
+            coverage_service = build_coverage_analysis_service(db)
+        except Exception as exc:
+            try:
+                db.rollback()
+                AnalysisReliabilityService(db, settings).fail_worker_initialization(
+                    analysis_run_item_id, dispatch_version, exc
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to persist analysis worker initialization failure",
+                    extra={
+                        "analysis_item_id": analysis_run_item_id,
+                        "dispatch_version": dispatch_version,
+                    },
+                )
+            logger.exception(
+                "Analysis worker initialization failed",
+                extra={
+                    "analysis_item_id": analysis_run_item_id,
+                    "dispatch_version": dispatch_version,
+                },
+            )
+            raise
         heartbeat_stop = threading.Event()
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
@@ -74,7 +97,7 @@ def execute_analysis_item(
         )
         heartbeat_thread.start()
         try:
-            build_coverage_analysis_service(db).execute_item(
+            coverage_service.execute_item(
                 analysis_run_item_id,
                 max_attempts=settings.analysis_item_max_attempts,
                 retry_delays_seconds=settings.analysis_retry_delays_seconds,
