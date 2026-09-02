@@ -433,11 +433,19 @@ class ReviewService:
         ).order_by(ReviewPackage.created_at.desc())
         return list(self.db.scalars(statement))
 
-    def create_analysis_run(self, review_id: str) -> AnalysisRun:
+    def create_analysis_run(self, review_id: str, *, strategy: str = "decomposed") -> AnalysisRun:
         review = self.get_review_package(review_id)
         if not review.requirement_snapshots:
             raise ValueError("Review package has no frozen requirements")
-        run = AnalysisRun(review_package_id=review.id, status="queued")
+        strategy_versions = {"original": "original-v1", "decomposed": "decomposed-v2"}
+        if strategy not in strategy_versions:
+            raise ValueError("Analysis strategy must be original or decomposed")
+        run = AnalysisRun(
+            review_package_id=review.id,
+            status="queued",
+            strategy=strategy,
+            strategy_version=strategy_versions[strategy],
+        )
         run.items = [
             AnalysisRunItem(requirement_snapshot_id=requirement.id, status="queued")
             for requirement in review.requirement_snapshots
@@ -511,6 +519,7 @@ class ReviewService:
         run.completed_at = None
         for item in failed:
             item.status = "queued"
+            item.attempt_count = 0
             item.dispatch_version += 1
             item.job_id = None
             item.lease_owner = None

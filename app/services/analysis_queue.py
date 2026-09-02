@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from app.core.config import Settings, get_settings
 
@@ -43,16 +43,28 @@ class AnalysisQueue(Protocol):
 @dataclass
 class RedisAnalysisQueue:
     settings: Settings
+    _connection: Any | None = field(default=None, init=False, repr=False)
+
+    def _get_connection(self):
+        if self._connection is None:
+            from redis import Redis
+
+            connection = Redis.from_url(
+                self.settings.redis_url,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+            )
+            connection.ping()
+            self._connection = connection
+        return self._connection
 
     def enqueue_dispatches(self, dispatches: Iterable[AnalysisDispatch]) -> dict[str, str]:
         try:
-            from redis import Redis
             from redis.exceptions import RedisError
             from rq import Queue
             from rq.job import Job
 
-            connection = Redis.from_url(self.settings.redis_url)
-            connection.ping()
+            connection = self._get_connection()
             queue = Queue(self.settings.analysis_queue_name, connection=connection)
             jobs = {}
             for dispatch in dispatches:
@@ -101,12 +113,10 @@ class RedisAnalysisQueue:
         ``queued``.  They are safe to dispatch again.
         """
         try:
-            from redis import Redis
             from rq.exceptions import NoSuchJobError
             from rq.job import Job
 
-            connection = Redis.from_url(self.settings.redis_url)
-            connection.ping()
+            connection = self._get_connection()
             stale: set[str] = set()
             for item_id, job_id in job_ids.items():
                 try:

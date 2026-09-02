@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 
-from app.api.auth import require_authenticated_user
+from app.api.auth import require_admin_user, require_authenticated_user
 from app.api.dependencies import DbSession
 from app.api.schemas import (
     RequirementBaselineCreate,
@@ -12,6 +12,7 @@ from app.api.schemas import (
     RequirementImportResponse,
     RequirementResponse,
 )
+from app.core.config import get_settings
 from app.domain.models import Requirement, RequirementBaseline
 from app.services.review_service import ReviewService
 
@@ -43,7 +44,24 @@ def requirement_response(item: Requirement) -> RequirementResponse:
     )
 
 
-@router.post("/requirement-baselines", response_model=RequirementBaselineResponse, status_code=status.HTTP_201_CREATED)
+def read_csv_upload(file: UploadFile) -> bytes:
+    settings = get_settings()
+    max_upload_bytes = settings.max_upload_size_mb * 1024 * 1024
+    content = file.file.read(max_upload_bytes + 1)
+    if len(content) > max_upload_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds {settings.max_upload_size_mb} MB limit",
+        )
+    return content
+
+
+@router.post(
+    "/requirement-baselines",
+    response_model=RequirementBaselineResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin_user)],
+)
 def create_requirement_baseline(payload: RequirementBaselineCreate, db: DbSession):
     try:
         item = ReviewService(db).create_baseline(**payload.model_dump())
@@ -62,8 +80,9 @@ def list_requirement_baselines(db: DbSession):
     "/requirement-baselines/import",
     response_model=RequirementBaselineImportResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin_user)],
 )
-async def import_requirement_baseline(
+def import_requirement_baseline(
     db: DbSession,
     file: UploadFile = File(...),
     name: str | None = Form(default=None),
@@ -74,7 +93,7 @@ async def import_requirement_baseline(
     try:
         baseline, requirements = ReviewService(db).create_baseline_from_csv(
             file_name=file.filename,
-            content=await file.read(),
+            content=read_csv_upload(file),
             name=name,
             system=system,
         )
@@ -91,12 +110,18 @@ async def import_requirement_baseline(
     )
 
 
-@router.post("/requirement-baselines/{baseline_id}/requirements/import", response_model=RequirementImportResponse)
-async def import_requirements(baseline_id: str, db: DbSession, file: UploadFile = File(...)):
+@router.post(
+    "/requirement-baselines/{baseline_id}/requirements/import",
+    response_model=RequirementImportResponse,
+    dependencies=[Depends(require_admin_user)],
+)
+def import_requirements(baseline_id: str, db: DbSession, file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="A CSV file is required")
     try:
-        requirements = ReviewService(db).import_requirements_csv(baseline_id, await file.read())
+        requirements = ReviewService(db).import_requirements_csv(
+            baseline_id, read_csv_upload(file)
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

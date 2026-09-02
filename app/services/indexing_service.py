@@ -5,15 +5,15 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from time import monotonic, sleep
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
-from app.domain.models import DocumentChunk, DocumentVersion
+from app.domain.models import DocumentChunk, DocumentIndexDispatchOutbox, DocumentVersion
 from app.domain.ports import DocumentChunkIndex
 from app.services.embedding_service import EmbeddingService
-from app.services.indexing_queue import DocumentIndexQueue
 
 
 INDEX_QUEUEABLE_STATUSES = {"parsed_pending_index", "index_failed"}
@@ -21,11 +21,10 @@ INDEX_ACTIVE_STATUSES = {"index_queued", "indexing"}
 
 
 class DocumentIndexSubmissionService:
-    """Persist an indexing request before handing it to the background queue."""
+    """Atomically persist queued state and a durable indexing Outbox row."""
 
-    def __init__(self, db: Session, queue: DocumentIndexQueue):
+    def __init__(self, db: Session):
         self.db = db
-        self.queue = queue
 
     def queue_document_version(self, document_version_id: str) -> DocumentVersion:
         version = self.db.scalar(
@@ -35,44 +34,41 @@ class DocumentIndexSubmissionService:
         )
         if version is None:
             raise LookupError("Document version not found")
-        if not version.chunks:
+        if not any(chunk.element_type != "diagnostic" for chunk in version.chunks):
             raise ValueError("Document must be parsed before it can be indexed")
         if version.ingestion_status in INDEX_ACTIVE_STATUSES:
             raise ValueError("Document indexing is already queued or running")
         if version.ingestion_status not in INDEX_QUEUEABLE_STATUSES:
             raise ValueError("Document must be parsed again before a new index can be created")
 
-        # The conditional update makes two simultaneous submissions collapse to
-        # one durable queued state before either caller can publish to Redis.
-        claimed = self.db.execute(
+        # The status transition and Outbox insert commit together. If the API
+        # exits at any point, maintenance can still discover executable work.
+        next_dispatch_version = self.db.execute(
             update(DocumentVersion)
             .where(
                 DocumentVersion.id == document_version_id,
                 DocumentVersion.ingestion_status.in_(INDEX_QUEUEABLE_STATUSES),
             )
-            .values(ingestion_status="index_queued", ingestion_error=None)
-        )
-        if claimed.rowcount != 1:
+            .values(
+                ingestion_status="index_queued",
+                ingestion_error=None,
+                index_dispatch_version=DocumentVersion.index_dispatch_version + 1,
+                index_job_id=None,
+                index_started_at=None,
+            )
+            .returning(DocumentVersion.index_dispatch_version)
+        ).scalar_one_or_none()
+        if next_dispatch_version is None:
             self.db.rollback()
             raise ValueError("Document indexing is already queued or running")
+        self.db.add(
+            DocumentIndexDispatchOutbox(
+                document_version_id=document_version_id,
+                dispatch_version=next_dispatch_version,
+            )
+        )
         self.db.commit()
         self.db.refresh(version)
-
-        try:
-            self.queue.enqueue(document_version_id)
-        except Exception as exc:
-            # A queued status must always mean that executable work exists.
-            self.db.execute(
-                update(DocumentVersion)
-                .where(
-                    DocumentVersion.id == document_version_id,
-                    DocumentVersion.ingestion_status == "index_queued",
-                )
-                .values(ingestion_status="index_failed", ingestion_error=str(exc))
-            )
-            self.db.commit()
-            self.db.refresh(version)
-            raise
         return version
 
 
@@ -119,7 +115,9 @@ class DocumentIndexingService:
         self.sleeper = sleeper
         self._token_reservations: deque[tuple[float, int]] = deque()
 
-    def index_document_version(self, document_version_id: str) -> DocumentVersion:
+    def index_document_version(
+        self, document_version_id: str, expected_dispatch_version: int | None = None
+    ) -> DocumentVersion:
         statement = (
             select(DocumentVersion)
             .options(selectinload(DocumentVersion.document), selectinload(DocumentVersion.chunks))
@@ -128,21 +126,31 @@ class DocumentIndexingService:
         version = self.db.scalar(statement)
         if version is None:
             raise LookupError("Document version not found")
-        if not version.chunks:
+        if not any(chunk.element_type != "diagnostic" for chunk in version.chunks):
             raise ValueError("Document must be parsed before it can be indexed")
+        if expected_dispatch_version is None:
+            expected_dispatch_version = version.index_dispatch_version
 
         claimed = self.db.execute(
             update(DocumentVersion)
             .where(
                 DocumentVersion.id == document_version_id,
                 DocumentVersion.ingestion_status == "index_queued",
+                DocumentVersion.index_dispatch_version == expected_dispatch_version,
             )
-            .values(ingestion_status="indexing", ingestion_error=None)
+            .values(
+                ingestion_status="indexing",
+                ingestion_error=None,
+                index_started_at=datetime.now(timezone.utc),
+            )
         )
         if claimed.rowcount != 1:
             self.db.rollback()
             self.db.refresh(version)
-            if version.ingestion_status in {"indexing", "indexed"}:
+            if (
+                version.index_dispatch_version != expected_dispatch_version
+                or version.ingestion_status in {"indexing", "indexed"}
+            ):
                 # A duplicate/stale RQ delivery must not embed or overwrite the
                 # same document a second time.
                 return version
@@ -150,7 +158,10 @@ class DocumentIndexingService:
         self.db.commit()
         self.db.refresh(version)
         try:
-            chunks = sorted(version.chunks, key=lambda item: item.chunk_index)
+            chunks = sorted(
+                (chunk for chunk in version.chunks if chunk.element_type != "diagnostic"),
+                key=lambda item: item.chunk_index,
+            )
             vectors = self._embed_texts([chunk.content for chunk in chunks])
             if len(vectors) != len(chunks):
                 raise ValueError("Embedding provider returned an unexpected number of vectors")
@@ -170,11 +181,37 @@ class DocumentIndexingService:
                 for chunk, vector in zip(chunks, vectors)
             ]
             self.repository.replace_document_version(records)
-            version.ingestion_status = "indexed"
+            self.db.execute(
+                update(DocumentVersion)
+                .where(
+                    DocumentVersion.id == document_version_id,
+                    DocumentVersion.ingestion_status == "indexing",
+                    DocumentVersion.index_dispatch_version == expected_dispatch_version,
+                )
+                .values(
+                    ingestion_status="indexed",
+                    ingestion_error=None,
+                    index_job_id=None,
+                    index_started_at=None,
+                )
+            )
             self.db.commit()
         except Exception as exc:
-            version.ingestion_status = "index_failed"
-            version.ingestion_error = str(exc)
+            self.db.rollback()
+            self.db.execute(
+                update(DocumentVersion)
+                .where(
+                    DocumentVersion.id == document_version_id,
+                    DocumentVersion.ingestion_status == "indexing",
+                    DocumentVersion.index_dispatch_version == expected_dispatch_version,
+                )
+                .values(
+                    ingestion_status="index_failed",
+                    ingestion_error=str(exc),
+                    index_job_id=None,
+                    index_started_at=None,
+                )
+            )
             self.db.commit()
             raise
         self.db.refresh(version)

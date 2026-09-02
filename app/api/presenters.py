@@ -16,7 +16,6 @@ def document_response(item: DocumentVersion) -> DocumentVersionResponse:
         status=item.status,
         file_name=item.file_name,
         source_url=item.source_url,
-        storage_path=item.storage_path,
         ingestion_status=item.ingestion_status,
         ingestion_error=item.ingestion_error,
         page_count=item.page_count,

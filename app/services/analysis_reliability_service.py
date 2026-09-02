@@ -322,7 +322,6 @@ class AnalysisReliabilityService:
                 update(AnalysisAttempt)
                 .where(
                     AnalysisAttempt.analysis_run_item_id == item.id,
-                    AnalysisAttempt.attempt_number == item.attempt_count,
                     AnalysisAttempt.status == "running",
                 )
                 .values(
@@ -353,6 +352,36 @@ class AnalysisReliabilityService:
         )
         self.db.commit()
         return renewed
+
+    def fail_worker_initialization(
+        self, item_id: str, dispatch_version: int, error: Exception
+    ) -> bool:
+        """Fail only the queued item targeted by a worker that could not initialize."""
+        message = f"Worker initialization failed ({error.__class__.__name__}): {error}"
+        now = self._now()
+        result = self.db.execute(
+            update(AnalysisRunItem)
+            .where(
+                AnalysisRunItem.id == item_id,
+                AnalysisRunItem.status == "queued",
+                AnalysisRunItem.dispatch_version == dispatch_version,
+            )
+            .values(
+                status="failed",
+                error_message=message,
+                completed_at=now,
+                job_id=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+            )
+            .returning(AnalysisRunItem.analysis_run_id)
+        )
+        run_id = result.scalar_one_or_none()
+        if run_id is not None:
+            self._reconcile_runs({run_id}, now)
+        self.db.commit()
+        return run_id is not None
 
     def reject_incompatible_dispatch(
         self, item_id: str, dispatch_version: int, *, received_schema_version: int

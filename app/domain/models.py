@@ -79,6 +79,11 @@ class DocumentVersion(Base):
     storage_path: Mapped[str | None] = mapped_column(String(1000))
     ingestion_status: Mapped[str] = mapped_column(String(40), nullable=False, default="registered")
     ingestion_error: Mapped[str | None] = mapped_column(Text)
+    index_dispatch_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    index_job_id: Mapped[str | None] = mapped_column(String(160))
+    index_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     page_count: Mapped[int | None] = mapped_column(Integer)
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     supersedes_version_id: Mapped[str | None] = mapped_column(
@@ -96,6 +101,9 @@ class DocumentVersion(Base):
     figures: Mapped[list[DocumentFigure]] = relationship(
         back_populates="document_version", cascade="all, delete-orphan"
     )
+    index_dispatches: Mapped[list[DocumentIndexDispatchOutbox]] = relationship(
+        back_populates="document_version", cascade="all, delete-orphan"
+    )
 
 
 class DocumentChunk(Base):
@@ -109,11 +117,43 @@ class DocumentChunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     page: Mapped[int] = mapped_column(Integer, nullable=False)
     section: Mapped[str | None] = mapped_column(String(500))
+    element_type: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="text", server_default="text"
+    )
+    source_metadata: Mapped[dict | None] = mapped_column(JSON)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     document_version: Mapped[DocumentVersion] = relationship(back_populates="chunks")
+
+
+class DocumentIndexDispatchOutbox(Base):
+    """Transactional request to publish one document-indexing job to RQ."""
+
+    __tablename__ = "document_index_dispatch_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id",
+            "dispatch_version",
+            name="uq_document_index_dispatch_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    document_version_id: Mapped[str] = mapped_column(
+        ForeignKey("document_versions.id"), nullable=False, index=True
+    )
+    dispatch_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+    job_id: Mapped[str | None] = mapped_column(String(160))
+    publish_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    document_version: Mapped[DocumentVersion] = relationship(back_populates="index_dispatches")
 
 
 class DocumentFigure(Base):
@@ -242,6 +282,12 @@ class AnalysisRun(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     review_package_id: Mapped[str] = mapped_column(ForeignKey("review_packages.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="queued")
+    strategy: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="decomposed", server_default="decomposed"
+    )
+    strategy_version: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="decomposed-v2", server_default="decomposed-v2"
+    )
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -276,6 +322,7 @@ class AnalysisRunItem(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+    analysis_trace: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

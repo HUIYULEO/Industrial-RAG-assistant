@@ -11,7 +11,13 @@ from sqlalchemy import select
 
 from app.domain.evidence import EvidenceChunk
 from app.domain.enums import CoverageStatus
-from app.domain.models import AnalysisDispatchOutbox, AnalysisRun
+from app.domain.models import (
+    AnalysisAttempt,
+    AnalysisDispatchOutbox,
+    AnalysisRun,
+    DocumentIndexDispatchOutbox,
+    DocumentVersion,
+)
 from app.api.auth import require_authenticated_user
 from app.bootstrap.service_factory import build_design_review_chat_service
 from app.repositories import database
@@ -23,7 +29,13 @@ from app.services.coverage_service import (
     CoverageAnalysisService,
 )
 from app.services.visual_evidence_service import VisualAnalysis, VisualEvidenceService
-from app.services.design_review_chat_service import PreparedAnswer
+from app.services.design_review_chat_service import (
+    DesignReviewChatService,
+    GroundedAnswer,
+    NormalizedQuery,
+    PreparedAnswer,
+    UNVERIFIED_CITATIONS_LIMITATION,
+)
 from app.services.analysis_queue import get_analysis_queue
 from app.services.analysis_reliability_service import AnalysisReliabilityService
 from app.core.config import get_settings
@@ -35,6 +47,7 @@ def review_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     database.get_session_factory.cache_clear()
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'review.db'}")
     monkeypatch.setenv("ANALYSIS_QUEUE_BACKEND", "memory")
+    monkeypatch.setenv("AUTH_SECRET", "test-secret-that-is-long-enough")
     database.initialise_database()
     from app.main import app
     app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedUser(
@@ -42,7 +55,7 @@ def review_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         organization_id="organization-1",
         email="test.engineer@example.com",
         display_name="Test Engineer",
-        role="engineer",
+        role="admin",
     )
     with TestClient(app) as client:
         yield client
@@ -68,7 +81,17 @@ def create_design_document(client: TestClient, *, document_type: str = "FS", ver
     return response.json()["id"]
 
 
-def test_evidence_chat_streams_tokens_then_final_citations(review_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+def test_document_responses_do_not_expose_storage_paths(review_client: TestClient):
+    version_id = create_design_document(review_client)
+
+    documents = review_client.get("/documents")
+
+    assert documents.status_code == 200
+    document = next(item for item in documents.json() if item["id"] == version_id)
+    assert "storage_path" not in document
+
+
+def test_evidence_chat_streams_tokens_without_unverified_citations(review_client: TestClient, monkeypatch: pytest.MonkeyPatch):
     from app.api.routes import chat as chat_routes
     from app.main import app
 
@@ -110,7 +133,196 @@ def test_evidence_chat_streams_tokens_then_final_citations(review_client: TestCl
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'event: token\ndata: {"text": "Task dispatch records "}' in response.text
     assert 'event: final' in response.text
-    assert '"chunk_id": "chunk-001"' in response.text
+    assert '"citations": []' in response.text
+    assert UNVERIFIED_CITATIONS_LIMITATION in response.text
+
+
+def test_chat_api_does_not_expose_invalid_non_streaming_citations(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.api.routes import chat as chat_routes
+    from app.main import app
+
+    evidence = EvidenceChunk(
+        chunk_id="chunk-001",
+        document_version_id="version-1",
+        document_title="Fleet Manager FS",
+        document_type="FS",
+        version="1.0",
+        page=3,
+        section="Retention",
+        content="Task dispatch records are retained for 90 days.",
+    )
+
+    class FakeRetrieval:
+        def retrieve(self, *_args, **_kwargs):
+            return [evidence]
+
+    class FakeNormalizer:
+        def normalize(self, *_args, **_kwargs):
+            return NormalizedQuery(retrieval_query="retention period")
+
+    class FakeGenerator:
+        def generate(self, **_kwargs):
+            return GroundedAnswer(
+                answer="Task dispatch records are retained.",
+                evidence_chunk_ids=["unknown-chunk"],
+            )
+
+    class FakeReviewService:
+        def get_review_package(self, _review_id):
+            return SimpleNamespace(
+                system="fleet_manager",
+                document_links=[SimpleNamespace(document_version_id="version-1")],
+            )
+
+    service = DesignReviewChatService(
+        FakeRetrieval(), FakeNormalizer(), FakeGenerator()
+    )
+    monkeypatch.setattr(chat_routes, "scoped_review_service", lambda *_: FakeReviewService())
+    app.dependency_overrides[build_design_review_chat_service] = lambda: service
+    try:
+        response = review_client.post(
+            "/design-review/chat",
+            json={
+                "question": "How long are records retained?",
+                "review_package_id": "review-1",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(build_design_review_chat_service, None)
+
+    assert response.status_code == 200
+    assert response.json()["citations"] == []
+    assert response.json()["limitations"] == UNVERIFIED_CITATIONS_LIMITATION
+
+
+@pytest.mark.asyncio
+async def test_chat_closes_review_session_before_provider_and_stream_body(monkeypatch):
+    from app.api.routes import chat as chat_routes
+    from app.api.schemas import ReviewChatRequest
+    from app.services.design_review_chat_service import GroundedAnswer
+
+    sessions = []
+
+    class FakeSession:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeReviewService:
+        def get_review_package(self, _review_id):
+            return SimpleNamespace(
+                system="fleet_manager",
+                document_links=[SimpleNamespace(document_version_id="document-1")],
+            )
+
+    class FakeChat:
+        def answer(self, **kwargs):
+            assert sessions[-1].closed is True
+            assert kwargs["document_version_ids"] == ["document-1"]
+            assert kwargs["system"] == "fleet_manager"
+            return GroundedAnswer(answer="Ready"), [], "query"
+
+        def prepare(self, **kwargs):
+            assert sessions[-1].closed is True
+            assert kwargs["document_version_ids"] == ["document-1"]
+            assert kwargs["system"] == "fleet_manager"
+            return PreparedAnswer(
+                "query",
+                [],
+                [],
+                no_evidence_answer=GroundedAnswer(answer="Pending"),
+            )
+
+        def stream_answer(self, **_):
+            assert sessions[-1].closed is True
+            yield "Ready"
+
+    def make_session():
+        session = FakeSession()
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(chat_routes, "get_session_factory", lambda: make_session)
+    monkeypatch.setattr(
+        chat_routes,
+        "scoped_review_service",
+        lambda _db, _user: FakeReviewService(),
+    )
+    payload = ReviewChatRequest(question="Ready?", review_package_id="review-1")
+    user = AuthenticatedUser(
+        id="engineer-1",
+        organization_id="organization-1",
+        email="engineer@example.com",
+        display_name="Engineer",
+        role="engineer",
+    )
+
+    result = chat_routes.design_review_chat(payload, user, FakeChat())
+    stream = chat_routes.stream_design_review_chat(payload, user, FakeChat())
+
+    assert result.answer == "Ready"
+    assert len(sessions) == 2
+    assert all(session.closed for session in sessions)
+    chunks = [chunk async for chunk in stream.body_iterator]
+    body = "".join(
+        chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks
+    )
+    assert 'event: final' in body
+    assert all(session.closed for session in sessions)
+
+
+def test_chat_unknown_errors_are_logged_and_hidden_for_http_and_stream(
+    review_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    from app.api.routes import chat as chat_routes
+    from app.main import app
+
+    class FailingChat:
+        def answer(self, **_):
+            raise RuntimeError("provider credential leaked by adapter")
+
+        def prepare(self, **_):
+            raise RuntimeError("provider credential leaked by stream adapter")
+
+    class FakeReviewService:
+        def get_review_package(self, _):
+            return SimpleNamespace(
+                system="fleet_manager",
+                document_links=[SimpleNamespace(document_version_id="version-1")],
+            )
+
+    monkeypatch.setattr(chat_routes, "scoped_review_service", lambda *_: FakeReviewService())
+    app.dependency_overrides[build_design_review_chat_service] = lambda: FailingChat()
+    caplog.set_level("ERROR", logger="industrial_rag.app.api.routes.chat")
+    try:
+        http_response = review_client.post(
+            "/design-review/chat",
+            json={"question": "What failed?", "review_package_id": "review-secret-boundary"},
+        )
+        stream_response = review_client.post(
+            "/design-review/chat/stream",
+            json={"question": "What failed?", "review_package_id": "review-secret-boundary"},
+        )
+    finally:
+        app.dependency_overrides.pop(build_design_review_chat_service, None)
+
+    assert http_response.status_code == 502
+    assert http_response.json()["detail"] == "The evidence answer could not be generated."
+    assert "provider credential" not in http_response.text
+    assert 'event: error\ndata: {"detail": "The evidence answer could not be generated."}' in stream_response.text
+    assert "provider credential" not in stream_response.text
+    error_records = [
+        record
+        for record in caplog.records
+        if "review-secret-boundary" in record.getMessage()
+    ]
+    assert len(error_records) == 2
+    assert all(record.exc_info for record in error_records)
 
 
 def test_document_archive_preserves_auditable_record(review_client: TestClient):
@@ -155,6 +367,76 @@ def test_document_in_frozen_review_package_cannot_be_archived(review_client: Tes
 
     assert response.status_code == 400
     assert "frozen Review Package" in response.json()["detail"]
+
+
+def test_frozen_document_cannot_be_uploaded_or_reparsed(review_client: TestClient):
+    version_id = create_design_document(review_client)
+    uploaded = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("source.csv", b"interface,owner\nWCS API,Automation\n", "text/csv")},
+    )
+    assert uploaded.status_code == 200
+    baseline = review_client.post(
+        "/requirement-baselines", json={"name": "Ingestion guard URS", "system": "fleet_manager"}
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={
+            "file": (
+                "urs.csv",
+                b"requirement_code,requirement_text\nURS-001,Record retention\n",
+                "text/csv",
+            )
+        },
+    )
+    review = review_client.post(
+        "/review-packages",
+        json={
+            "name": "Ingestion guard review",
+            "system": "fleet_manager",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [version_id],
+        },
+    )
+    assert review.status_code == 201
+
+    replacement = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("replacement.csv", b"interface,owner\nMES API,IT\n", "text/csv")},
+    )
+    reparsed = review_client.post(f"/documents/{version_id}/reparse")
+
+    assert replacement.status_code == 400
+    assert reparsed.status_code == 400
+    assert "frozen Review Package" in replacement.json()["detail"]
+    assert "frozen Review Package" in reparsed.json()["detail"]
+
+
+@pytest.mark.parametrize("ingestion_status", ["index_queued", "indexing"])
+def test_active_index_prevents_upload_and_reparse(
+    review_client: TestClient, ingestion_status: str
+):
+    version_id = create_design_document(review_client)
+    uploaded = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("source.csv", b"interface,owner\nWCS API,Automation\n", "text/csv")},
+    )
+    assert uploaded.status_code == 200
+    with database.get_session_factory()() as db:
+        version = db.get(DocumentVersion, version_id)
+        version.ingestion_status = ingestion_status
+        db.commit()
+
+    replacement = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("replacement.csv", b"interface,owner\nMES API,IT\n", "text/csv")},
+    )
+    reparsed = review_client.post(f"/documents/{version_id}/reparse")
+
+    assert replacement.status_code == 400
+    assert reparsed.status_code == 400
+    assert "indexing" in replacement.json()["detail"]
+    assert "indexing" in reparsed.json()["detail"]
 
 
 def test_archived_document_cannot_be_added_to_a_new_review_package(review_client: TestClient):
@@ -260,6 +542,15 @@ def test_document_index_submission_returns_accepted_without_running_embeddings(
     assert queued.status_code == 202
     assert queued.json()["ingestion_status"] == "index_queued"
     assert queued.json()["ingestion_error"] is None
+    with database.get_session_factory()() as db:
+        index_outbox = db.scalar(
+            select(DocumentIndexDispatchOutbox).where(
+                DocumentIndexDispatchOutbox.document_version_id == version_id
+            )
+        )
+        assert index_outbox is not None
+        assert index_outbox.status == "pending"
+        assert index_outbox.job_id is None
     persisted = next(
         item for item in review_client.get("/documents").json() if item["id"] == version_id
     )
@@ -268,6 +559,77 @@ def test_document_index_submission_returns_accepted_without_running_embeddings(
     duplicate = review_client.post(f"/documents/{version_id}/index")
     assert duplicate.status_code == 409
     assert "already queued or running" in duplicate.json()["detail"]
+
+
+def test_index_unknown_error_is_logged_with_document_id_and_hidden(
+    review_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    from app.services.indexing_service import DocumentIndexSubmissionService
+
+    version_id = create_design_document(review_client)
+
+    def fail_submission(_self, _document_version_id):
+        raise RuntimeError("redis://user:secret@internal-host")
+
+    monkeypatch.setattr(
+        DocumentIndexSubmissionService,
+        "queue_document_version",
+        fail_submission,
+    )
+    caplog.set_level("ERROR", logger="industrial_rag.app.api.routes.documents")
+
+    response = review_client.post(f"/documents/{version_id}/index")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Document indexing is temporarily unavailable."
+    assert "internal-host" not in response.text
+    records = [record for record in caplog.records if version_id in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].exc_info
+
+
+def test_visual_analysis_unknown_error_is_logged_with_document_id_and_hidden(
+    review_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    from app.api.dependencies import get_visual_evidence_service
+    from app.api.routes import documents as document_routes
+    from app.bootstrap.service_factory import build_visual_interpreter
+    from app.main import app
+
+    class FailingVisualEvidence:
+        def analyse_figures(self, _document_version_id, _interpreter):
+            raise RuntimeError("vision provider secret")
+
+    app.dependency_overrides[get_visual_evidence_service] = lambda: FailingVisualEvidence()
+    app.dependency_overrides[build_visual_interpreter] = lambda: object()
+    monkeypatch.setattr(
+        document_routes,
+        "get_settings",
+        lambda: SimpleNamespace(enable_visual_analysis=True),
+    )
+    caplog.set_level("ERROR", logger="industrial_rag.app.api.routes.documents")
+    try:
+        response = review_client.post(
+            "/documents/document-visual-boundary/figures/analyse"
+        )
+    finally:
+        app.dependency_overrides.pop(get_visual_evidence_service, None)
+        app.dependency_overrides.pop(build_visual_interpreter, None)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Visual analysis is temporarily unavailable."
+    assert "provider secret" not in response.text
+    records = [
+        record
+        for record in caplog.records
+        if "document-visual-boundary" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].exc_info
 
 
 def test_progress_reconciles_a_stale_run_after_all_items_settle(review_client: TestClient):
@@ -365,6 +727,192 @@ def test_progress_requeues_items_when_their_rq_jobs_are_stale(review_client: Tes
         db.close()
     finally:
         app.dependency_overrides.pop(get_analysis_queue, None)
+
+
+def test_manual_retry_resets_cycle_attempts_and_preserves_attempt_history(
+    review_client: TestClient,
+):
+    baseline = review_client.post(
+        "/requirement-baselines",
+        json={"name": "Retry cycle URS", "system": "fleet_manager"},
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={
+            "file": (
+                "urs.csv",
+                b"requirement_code,requirement_text\nURS-001,Record retention\n",
+                "text/csv",
+            )
+        },
+    )
+    review = review_client.post(
+        "/review-packages",
+        json={
+            "name": "Retry cycle review",
+            "system": "fleet_manager",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [create_design_document(review_client)],
+        },
+    ).json()
+    run = review_client.post(f"/review-packages/{review['id']}/analyses").json()
+
+    with database.get_session_factory()() as db:
+        persisted_run = db.get(AnalysisRun, run["id"])
+        item = persisted_run.items[0]
+        item.status = "failed"
+        item.attempt_count = 3
+        persisted_run.status = "failed"
+        db.add_all(
+            [
+                AnalysisAttempt(
+                    analysis_run_item_id=item.id,
+                    attempt_number=attempt_number,
+                    worker_id="worker-old-cycle",
+                    status="failed",
+                )
+                for attempt_number in range(1, 4)
+            ]
+        )
+        db.commit()
+        item_id = item.id
+
+    retried = review_client.post(f"/analysis-runs/{run['id']}/retry")
+
+    assert retried.status_code == 202
+    assert retried.json()["status"] == "queued"
+    with database.get_session_factory()() as db:
+        item = db.get(AnalysisRun, run["id"]).items[0]
+        assert item.attempt_count == 0
+        assert item.dispatch_version == 1
+        service = CoverageAnalysisService(db, retrieval=None, judge=None)
+        claims = [
+            service._claim_attempt(
+                item_id,
+                worker_id="worker-new-cycle",
+                max_attempts=3,
+                lease_seconds=60,
+                expected_dispatch_version=1,
+            )
+            for _ in range(4)
+        ]
+        attempts = list(
+            db.scalars(
+                select(AnalysisAttempt)
+                .where(AnalysisAttempt.analysis_run_item_id == item_id)
+                .order_by(AnalysisAttempt.attempt_number)
+            )
+        )
+
+    assert [claim[1:] if claim else None for claim in claims] == [
+        (1, 4),
+        (2, 5),
+        (3, 6),
+        None,
+    ]
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3, 4, 5, 6]
+
+
+@pytest.mark.asyncio
+async def test_sse_uses_short_sessions_in_threadpool_and_reads_poll_interval_once(monkeypatch):
+    from app.api.routes import analysis_runs as analysis_routes
+
+    sessions = []
+    threadpool_calls = []
+    settings_calls = 0
+
+    class FakeSession:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeService:
+        def get_analysis_run(self, _run_id):
+            return object()
+
+    class FakeProgress:
+        status = "completed"
+
+        def model_dump_json(self):
+            return '{"status":"completed"}'
+
+    class FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    def make_session():
+        session = FakeSession()
+        sessions.append(session)
+        return session
+
+    async def tracked_threadpool(func, *args):
+        threadpool_calls.append(func.__name__)
+        return func(*args)
+
+    def fake_settings():
+        nonlocal settings_calls
+        settings_calls += 1
+        return SimpleNamespace(analysis_progress_poll_seconds=99)
+
+    monkeypatch.setattr(analysis_routes, "get_session_factory", lambda: make_session)
+    monkeypatch.setattr(analysis_routes, "scoped_review_service", lambda _db, _user: FakeService())
+    monkeypatch.setattr(analysis_routes, "analysis_progress_response", lambda _run: FakeProgress())
+    monkeypatch.setattr(analysis_routes, "run_in_threadpool", tracked_threadpool)
+    monkeypatch.setattr(analysis_routes, "get_settings", fake_settings)
+    user = AuthenticatedUser(
+        id="engineer-1",
+        organization_id="organization-1",
+        email="test.engineer@example.com",
+        display_name="Test Engineer",
+        role="engineer",
+    )
+
+    response = await analysis_routes.stream_analysis_run_progress(
+        "run-1", FakeRequest(), user
+    )
+
+    assert len(sessions) == 1
+    assert sessions[0].closed is True
+    chunks = [chunk async for chunk in response.body_iterator]
+    body = "".join(
+        chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks
+    )
+    assert body == (
+        'event: progress\ndata: {"status":"completed"}\n\n'
+        'event: complete\ndata: {"status":"completed"}\n\n'
+    )
+    assert len(sessions) == 2
+    assert all(session.closed for session in sessions)
+    assert threadpool_calls == ["_load_analysis_progress", "_load_analysis_progress"]
+    assert settings_calls == 1
+
+
+def test_sse_progress_query_closes_its_session_on_error(monkeypatch):
+    from app.api.routes import analysis_runs as analysis_routes
+
+    class FakeSession:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FailingService:
+        def get_analysis_run(self, _run_id):
+            raise RuntimeError("database query failed")
+
+    session = FakeSession()
+    monkeypatch.setattr(analysis_routes, "get_session_factory", lambda: lambda: session)
+    monkeypatch.setattr(
+        analysis_routes,
+        "scoped_review_service",
+        lambda _db, _user: FailingService(),
+    )
+
+    with pytest.raises(RuntimeError, match="database query failed"):
+        analysis_routes._load_analysis_progress("run-1", object())
+
+    assert session.closed is True
 
 
 def test_review_packages_are_private_to_the_owner_within_an_organization(review_client: TestClient):
@@ -633,6 +1181,40 @@ def test_pdf_visual_evidence_is_rendered_before_explicit_analysis(
     assert "Candidate visual interpretation" in visual_chunk["content"]
 
 
+def test_optional_visual_candidate_failure_does_not_fail_upload_or_reparse(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    import fitz
+
+    def fail_visual_extraction(*args, **kwargs):
+        raise RuntimeError("visual renderer unavailable")
+
+    monkeypatch.setattr(
+        VisualEvidenceService,
+        "extract_pdf_candidates",
+        fail_visual_extraction,
+    )
+    source = fitz.open()
+    page = source.new_page()
+    page.insert_text((72, 72), "5.1 Interface Diagram\nWCS sends tasks to the Fleet Manager.")
+    source_bytes = source.tobytes()
+    source.close()
+    version_id = create_design_document(review_client)
+
+    uploaded = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("interface.pdf", source_bytes, "application/pdf")},
+    )
+    reparsed = review_client.post(f"/documents/{version_id}/reparse")
+
+    assert uploaded.status_code == 200
+    assert uploaded.json()["ingestion_status"] == "parsed_pending_index"
+    assert reparsed.status_code == 200
+    assert reparsed.json()["ingestion_status"] == "parsed_pending_index"
+    chunks = review_client.get(f"/documents/{version_id}/chunks").json()
+    assert any("WCS sends tasks" in chunk["content"] for chunk in chunks)
+
+
 def test_docx_upload_preserves_heading_and_table_row_sources(review_client: TestClient):
     version_id = create_design_document(review_client)
     document = WordDocument()
@@ -679,6 +1261,130 @@ def test_csv_upload_preserves_rows_as_citable_chunks(review_client: TestClient):
     assert len(chunks) == 2
     assert chunks[0]["section"] == "CSV row 1"
     assert "owner: Automation" in chunks[0]["content"]
+
+
+def test_upload_parsing_runs_in_threadpool(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.api.routes import documents as document_routes
+
+    calls: list[str] = []
+
+    async def tracked_threadpool(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(document_routes, "run_in_threadpool", tracked_threadpool)
+    version_id = create_design_document(review_client)
+
+    response = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("source.csv", b"interface,owner\nWCS API,Automation\n", "text/csv")},
+    )
+
+    assert response.status_code == 200
+    assert calls == ["upload_and_parse"]
+
+
+def test_upload_reads_only_one_byte_beyond_configured_limit(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MAX_UPLOAD_SIZE_MB", "1")
+    version_id = create_design_document(review_client)
+
+    response = review_client.post(
+        f"/documents/{version_id}/upload",
+        files={"file": ("oversized.csv", b"x" * (1024 * 1024 + 1), "text/csv")},
+    )
+
+    assert response.status_code == 413
+    assert "File exceeds 1 MB limit" in response.json()["detail"]
+
+
+def test_both_requirement_csv_imports_reject_files_over_the_shared_limit(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MAX_UPLOAD_SIZE_MB", "1")
+    baseline = review_client.post(
+        "/requirement-baselines",
+        json={"name": "Bounded CSV baseline", "system": "fleet_manager"},
+    ).json()
+    oversized = b"x" * (1024 * 1024 + 1)
+
+    create_response = review_client.post(
+        "/requirement-baselines/import",
+        files={"file": ("oversized.csv", oversized, "text/csv")},
+    )
+    existing_response = review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={"file": ("oversized.csv", oversized, "text/csv")},
+    )
+
+    assert create_response.status_code == 413
+    assert existing_response.status_code == 413
+    assert create_response.json()["detail"] == "File exceeds 1 MB limit"
+    assert existing_response.json()["detail"] == "File exceeds 1 MB limit"
+
+
+def test_requirement_csv_import_routes_are_sync_and_use_bounded_file_reads(monkeypatch):
+    import inspect
+    from app.api.routes import requirements as requirement_routes
+
+    read_sizes = []
+
+    class FakeFile:
+        def read(self, size):
+            read_sizes.append(size)
+            return b"requirement_code,requirement_text\nURS-001,Ready\n"
+
+    monkeypatch.setattr(
+        requirement_routes,
+        "get_settings",
+        lambda: SimpleNamespace(max_upload_size_mb=1),
+    )
+
+    content = requirement_routes.read_csv_upload(
+        SimpleNamespace(file=FakeFile())
+    )
+
+    assert content.endswith(b"URS-001,Ready\n")
+    assert read_sizes == [1024 * 1024 + 1]
+    assert not inspect.iscoroutinefunction(
+        requirement_routes.import_requirement_baseline
+    )
+    assert not inspect.iscoroutinefunction(requirement_routes.import_requirements)
+
+
+@pytest.mark.asyncio
+async def test_upload_file_read_is_bounded_to_limit_plus_one(monkeypatch: pytest.MonkeyPatch):
+    from fastapi import HTTPException
+    from app.api.routes import documents as document_routes
+
+    read_sizes: list[int] = []
+
+    class FakeUpload:
+        filename = "oversized.csv"
+
+        async def read(self, size: int):
+            read_sizes.append(size)
+            return b"x" * size
+
+    monkeypatch.setattr(
+        document_routes,
+        "get_settings",
+        lambda: SimpleNamespace(max_upload_size_mb=1),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await document_routes.upload_document(
+            "document-version-1",
+            ingestion=object(),  # type: ignore[arg-type]
+            file=FakeUpload(),  # type: ignore[arg-type]
+            pdf_password=None,
+        )
+
+    assert error.value.status_code == 413
+    assert read_sizes == [1024 * 1024 + 1]
 
 
 def test_citation_reader_returns_the_requested_passage_in_source_order(review_client: TestClient):
@@ -991,3 +1697,116 @@ def test_matrix_excel_export_contains_all_rows_and_report_metadata(review_client
     matrix = workbook["URS Traceability Matrix"]
     assert matrix["A2"].value == "AGV-URS-010"
     assert matrix["F2"].value == "Assessment incomplete / technical exception"
+
+
+def test_original_strategy_is_persisted_and_retrieves_the_unchanged_urs_once(
+    review_client: TestClient,
+):
+    requirement_text = "The Fleet Manager shall retain the original dispatch record exactly."
+    queries: list[tuple[str, int]] = []
+
+    class FakeRetrieval:
+        def retrieve(self, query, filters, limit=8):
+            queries.append((query, limit))
+            return [
+                EvidenceChunk(
+                    chunk_id="chunk-original",
+                    document_version_id=filters.document_version_ids[0],
+                    document_title="Fleet Manager Functional Specification",
+                    document_type="FS",
+                    version="1.0",
+                    page=9,
+                    section="5.2 Records",
+                    content="The Fleet Manager retains the original dispatch record.",
+                )
+            ]
+
+    class FakeJudge:
+        def judge(self, *, requirement_code, requirement_text, evidence, audit_points):
+            assert len(audit_points) == 1
+            assert audit_points[0].review_point == requirement_text
+            return CandidateJudgment(
+                design_status=CoverageStatus.COVERED,
+                evidence_chunk_ids=["chunk-original"],
+                rationale="The record retention is explicit.",
+                audit_points=[
+                    AuditPointJudgment(
+                        **audit_points[0].model_dump(),
+                        design_status=CoverageStatus.COVERED,
+                        evidence_chunk_ids=["chunk-original"],
+                        rationale="The record retention is explicit.",
+                    )
+                ],
+            )
+
+    baseline = review_client.post(
+        "/requirement-baselines", json={"name": "Original baseline", "system": "fleet_manager_wcs"}
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={
+            "file": (
+                "urs.csv",
+                f"requirement_code,requirement_text\nURS-001,{requirement_text}\n".encode(),
+                "text/csv",
+            )
+        },
+    )
+    version_id = create_design_document(review_client)
+    review = review_client.post(
+        "/review-packages",
+        json={
+            "name": "Original workflow review",
+            "system": "fleet_manager_wcs",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [version_id],
+        },
+    ).json()
+
+    created = review_client.post(
+        f"/review-packages/{review['id']}/analyses", json={"strategy": "original"}
+    )
+    assert created.status_code == 202
+    run = created.json()
+    assert run["strategy"] == "original"
+    assert run["strategy_version"] == "original-v1"
+    assert review_client.get(f"/analysis-runs/{run['id']}").json()["strategy"] == "original"
+
+    db = database.get_session_factory()()
+    try:
+        CoverageAnalysisService(db, FakeRetrieval(), FakeJudge()).execute(run["id"])
+        persisted = db.get(AnalysisRun, run["id"])
+        trace = persisted.items[0].analysis_trace
+    finally:
+        db.close()
+
+    assert queries == [(requirement_text, 6)]
+    assert trace["strategy"] == "original"
+    assert trace["retrieval"]["query_policy"] == "original_urs_byte_for_byte"
+    assert trace["retrieval"]["queries"][0]["query"] == requirement_text
+    assert trace["retrieval"]["queries"][0]["ranked_chunk_ids"] == ["chunk-original"]
+
+
+def test_decomposed_strategy_keeps_at_most_three_unique_source_grounded_points():
+    requirement_text = (
+        "The AMR shall enter a safe state, report the fault status, and retain the event record."
+    )
+
+    class Planner:
+        def decompose(self, *, requirement_code, requirement_text):
+            return [
+                AuditPoint(point_id="p1", source_excerpt="enter a safe state", review_point="The AMR shall enter a safe state"),
+                AuditPoint(point_id="p2", source_excerpt="report the fault status", review_point="The AMR shall report the fault status"),
+                AuditPoint(point_id="p3", source_excerpt="retain the event record", review_point="The AMR shall retain the event record"),
+                AuditPoint(point_id="p4", source_excerpt="invented standard", review_point="Meet an invented standard"),
+            ]
+
+        def judge(self, **kwargs):
+            raise AssertionError("judge is not used in this unit test")
+
+    service = CoverageAnalysisService(None, None, Planner())  # type: ignore[arg-type]
+    points = service._audit_points("URS-001", requirement_text)
+
+    assert len(points) == 3
+    assert [point.point_id for point in points] == ["p1", "p2", "p3"]
+    assert all(point.source_excerpt in requirement_text for point in points)

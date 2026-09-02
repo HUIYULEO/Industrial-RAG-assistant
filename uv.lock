@@ -405,7 +405,6 @@ dependencies = [
     { name = "pyjwt" },
     { name = "pymilvus" },
     { name = "pymupdf" },
-    { name = "pypdf" },
     { name = "python-docx" },
     { name = "python-dotenv" },
     { name = "python-multipart" },
@@ -434,7 +433,6 @@ requires-dist = [
     { name = "pyjwt", specifier = "==2.10.1" },
     { name = "pymilvus", specifier = "==2.6.4" },
     { name = "pymupdf", specifier = "==1.26.5" },
-    { name = "pypdf", specifier = "==6.5.0" },
     { name = "python-docx", specifier = "==1.1.2" },
     { name = "python-dotenv", specifier = "==1.2.1" },
     { name = "python-multipart", specifier = ">=0.0.20" },
@@ -997,15 +995,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/28/90/87b7fdfc9cd6991a3eb69a5752f6343374c34f258c511c242f4d60791eea/pymupdf-1.26.5-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:e24e7a7d696bd398543cc5c147869edb2026d5d5a21b7f8e35db2f20170b389e", size = 24268203, upload-time = "2025-10-10T14:00:28.791Z" },
     { url = "https://files.pythonhosted.org/packages/2c/99/9d4b36485538e29df0a013fb02bbf6b5b0743a428fa07515e36631c43363/pymupdf-1.26.5-cp39-abi3-win32.whl", hash = "sha256:a2a42f5911d153a47bf5c3e162a0bfe8745eb9bec3e59fbaf87617b4003d8270", size = 17130722, upload-time = "2025-10-10T14:00:51.377Z" },
     { url = "https://files.pythonhosted.org/packages/c6/96/fd59c1532891762ea4815e73956c532053d5e26d56969e1e5d1e4ca4b207/pymupdf-1.26.5-cp39-abi3-win_amd64.whl", hash = "sha256:39a6fb58182b27b51ea8150a0cd2e4ee7e0cf71e9d6723978f28699b42ee61ae", size = 18747258, upload-time = "2025-10-10T14:01:37.346Z" },
-]
-
-[[package]]
-name = "pypdf"
-version = "6.5.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/4d/9b/db1056a54eda8cd44f9e5128e87e1142cb328295dad92bbec0d39f251641/pypdf-6.5.0.tar.gz", hash = "sha256:9e78950906380ae4f2ce1d9039e9008098ba6366a4d9c7423c4bdbd6e6683404", size = 5277655, upload-time = "2025-12-21T11:07:19.876Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/de/db/f2e7703791a1f32532618b82789ddddb7173b9e22d97e34cc11950d8e330/pypdf-6.5.0-py3-none-any.whl", hash = "sha256:9cef8002aaedeecf648dfd9ff1ce38f20ae8d88e2534fced6630038906440b25", size = 329560, upload-time = "2025-12-21T11:07:18.173Z" },
 ]
 
 [[package]]

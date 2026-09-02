@@ -10,6 +10,12 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+AUTH_SECRET_PLACEHOLDERS = {
+    "local-development-secret-change-before-shared-deployment",
+    "replace-with-a-unique-long-random-secret-before-sharing",
+}
+
+
 class Settings(BaseSettings):
     """Application settings with safe local-development defaults."""
 
@@ -45,8 +51,7 @@ class Settings(BaseSettings):
     # conventional supplier manual in the local review workspace by default.
     max_upload_size_mb: int = 50
     auth_required: bool = True
-    # Safe only for this local Docker workspace. Set a unique secret before sharing a deployment.
-    auth_secret: str = "local-development-secret-change-before-shared-deployment"
+    auth_secret: str | None = None
     access_token_expire_minutes: int = 480
     allow_self_registration: bool = True
     local_admin_email: str | None = None
@@ -65,6 +70,9 @@ class Settings(BaseSettings):
     analysis_queue_name: str = "design-review"
     document_index_queue_name: str = "document-indexing"
     document_index_job_timeout_seconds: int = 1800
+    document_index_queued_timeout_seconds: int = 900
+    document_index_stale_after_seconds: int = 2100
+    document_index_max_attempts: int = 3
     analysis_queue_backend: str = "redis"
     analysis_item_max_attempts: int = 3
     analysis_retry_delays_seconds: list[int] = [2, 5]
@@ -85,3 +93,16 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return settings at runtime rather than during module import."""
     return Settings()
+
+
+def validate_auth_configuration(settings: Settings) -> None:
+    """Reject unsupported or publicly known local authentication settings."""
+    if not settings.auth_required:
+        raise RuntimeError(
+            "AUTH_REQUIRED=false is not supported; authenticated workspace access is required"
+        )
+    secret = (settings.auth_secret or "").strip()
+    if not secret or secret in AUTH_SECRET_PLACEHOLDERS:
+        raise RuntimeError(
+            "AUTH_SECRET must be set to a non-placeholder value before the application starts"
+        )

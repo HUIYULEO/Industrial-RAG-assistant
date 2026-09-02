@@ -36,7 +36,6 @@ class DocumentVersionResponse(BaseModel):
     status: DocumentStatus
     file_name: str | None
     source_url: str | None
-    storage_path: str | None
     ingestion_status: str
     ingestion_error: str | None
     page_count: int | None
@@ -109,9 +108,15 @@ class AnalysisRunResponse(BaseModel):
     id: str
     review_package_id: str
     status: str
+    strategy: Literal["original", "decomposed"]
+    strategy_version: str
     error_message: str | None
     created_at: datetime | None
     completed_at: datetime | None
+
+
+class AnalysisRunCreate(BaseModel):
+    strategy: Literal["original", "decomposed"] = "decomposed"
 
 
 class AnalysisRunItemResponse(BaseModel):
@@ -138,6 +143,8 @@ class DocumentChunkResponse(BaseModel):
     chunk_index: int
     page: int
     section: str | None
+    element_type: str
+    source_metadata: dict | None
     content: str
 
 

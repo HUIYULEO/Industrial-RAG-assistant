@@ -11,7 +11,7 @@ from app.api.routes.documents import router as documents_router
 from app.api.routes.requirements import router as requirements_router
 from app.api.routes.review_packages import router as review_packages_router
 from app.api.routes.analysis_runs import router as analysis_runs_router
-from app.core.config import get_settings
+from app.core.config import get_settings, validate_auth_configuration
 from app.core.logging_config import get_logger, setup_logging
 from app.repositories.database import get_session_factory, initialise_database
 from app.services.auth_service import AuthService
@@ -23,10 +23,12 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logger.info("Starting Industrial RAG Assistant API")
+    settings = get_settings()
+    validate_auth_configuration(settings)
     initialise_database()
     db = get_session_factory()()
     try:
-        AuthService(db, get_settings()).bootstrap_admin()
+        AuthService(db, settings).bootstrap_admin()
     finally:
         db.close()
     logger.info("Application startup complete")
@@ -56,7 +58,6 @@ async def general_exception_handler(_, exc: Exception):
         content={
             "error": "InternalServerError",
             "message": "An unexpected error occurred. Please try again later.",
-            "details": {"error_type": exc.__class__.__name__},
         },
     )
 

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.workers import analysis_worker
 
 
@@ -68,7 +70,6 @@ def test_worker_assembles_and_executes_one_analysis_item(monkeypatch):
             calls["dispatch_version"] = expected_dispatch_version
 
     session = FakeSession()
-    monkeypatch.setattr(analysis_worker, "initialise_database", lambda: calls.setdefault("database", True))
     monkeypatch.setattr(analysis_worker, "get_session_factory", lambda: lambda: session)
     monkeypatch.setattr(
         analysis_worker,
@@ -86,7 +87,6 @@ def test_worker_assembles_and_executes_one_analysis_item(monkeypatch):
     analysis_worker.execute_analysis_item("analysis-item-1")
 
     assert calls == {
-        "database": True,
         "item_id": "analysis-item-1",
         "max_attempts": 3,
         "retry_delays_seconds": [1, 5],
@@ -94,3 +94,79 @@ def test_worker_assembles_and_executes_one_analysis_item(monkeypatch):
         "dispatch_version": 0,
         "closed": True,
     }
+    assert not hasattr(analysis_worker, "initialise_database")
+
+
+def test_worker_factory_failure_marks_matching_dispatch_failed_and_reraises(monkeypatch):
+    calls: dict[str, object] = {}
+
+    class FakeSession:
+        def rollback(self):
+            calls["rolled_back"] = True
+
+        def close(self):
+            calls["closed"] = True
+
+    class FakeReliability:
+        def __init__(self, db, settings):
+            calls["reliability_db"] = db
+
+        def fail_worker_initialization(self, item_id, dispatch_version, error):
+            calls["failed"] = (item_id, dispatch_version, str(error))
+            return True
+
+    session = FakeSession()
+    monkeypatch.setattr(analysis_worker, "get_session_factory", lambda: lambda: session)
+    monkeypatch.setattr(
+        analysis_worker,
+        "get_settings",
+        lambda: SimpleNamespace(worker_build_version="test"),
+    )
+    monkeypatch.setattr(analysis_worker, "AnalysisReliabilityService", FakeReliability)
+
+    def fail_factory(_db):
+        raise RuntimeError("provider configuration is invalid")
+
+    monkeypatch.setattr(analysis_worker, "build_coverage_analysis_service", fail_factory)
+
+    with pytest.raises(RuntimeError, match="provider configuration is invalid"):
+        analysis_worker.execute_analysis_item("analysis-item-1", dispatch_version=2)
+
+    assert calls == {
+        "rolled_back": True,
+        "reliability_db": session,
+        "failed": ("analysis-item-1", 2, "provider configuration is invalid"),
+        "closed": True,
+    }
+
+
+def test_worker_factory_failure_keeps_the_original_error_if_persistence_also_fails(monkeypatch):
+    class FakeSession:
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FailingReliability:
+        def __init__(self, _db, _settings):
+            pass
+
+        def fail_worker_initialization(self, _item_id, _dispatch_version, _error):
+            raise OSError("database unavailable")
+
+    monkeypatch.setattr(analysis_worker, "get_session_factory", lambda: lambda: FakeSession())
+    monkeypatch.setattr(
+        analysis_worker,
+        "get_settings",
+        lambda: SimpleNamespace(worker_build_version="test"),
+    )
+    monkeypatch.setattr(analysis_worker, "AnalysisReliabilityService", FailingReliability)
+
+    def fail_factory(_db):
+        raise RuntimeError("provider configuration is invalid")
+
+    monkeypatch.setattr(analysis_worker, "build_coverage_analysis_service", fail_factory)
+
+    with pytest.raises(RuntimeError, match="provider configuration is invalid"):
+        analysis_worker.execute_analysis_item("analysis-item-1")

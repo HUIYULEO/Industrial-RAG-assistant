@@ -21,6 +21,8 @@ export type Requirement = {
   priority?: string | null; category?: string | null; source_section?: string | null;
 };
 export type ReviewPackage = { id: string; owner_user_id: string; organization_id: string; name: string; system: string; requirement_count: number; design_document_version_ids: string[] };
+export type AnalysisStrategy = "original" | "decomposed";
+export type AnalysisRunSummary = { id: string; status: string; strategy: AnalysisStrategy; strategy_version: string };
 export type Finding = {
   id: string; requirement_code: string; requirement_text: string; design_status: string; rationale: string;
   gap?: string | null; suggested_reviewer_action?: string | null;
@@ -41,7 +43,7 @@ export type MatrixRow = {
   audit_points: AuditPoint[];
 };
 export type AnalysisProgress = {
-  id: string; status: string; error_message?: string | null; total_items: number; queued_items: number;
+  id: string; status: string; strategy: AnalysisStrategy; strategy_version: string; error_message?: string | null; total_items: number; queued_items: number;
   running_items: number; completed_items: number; failed_items: number;
   items: { id: string; requirement_code: string; status: string; attempt_count: number; error_message?: string | null }[];
 };
@@ -49,5 +51,5 @@ export type ChatAnswer = {
   answer: string; retrieval_query: string; limitations?: string | null;
   citations: { chunk_id: string; document_version_id: string; document_title: string; version: string; page?: number | null; section?: string | null; excerpt: string }[];
 };
-export type DocumentChunk = { id: string; chunk_index: number; page: number; section?: string | null; content: string };
+export type DocumentChunk = { id: string; chunk_index: number; page: number; section?: string | null; element_type: string; source_metadata?: Record<string, unknown> | null; content: string };
 export type DocumentChunkContext = { document_version_id: string; requested_chunk_id: string; chunks: DocumentChunk[] };

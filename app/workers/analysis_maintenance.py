@@ -14,6 +14,8 @@ from app.services.analysis_queue import (
     get_analysis_queue,
 )
 from app.services.analysis_reliability_service import AnalysisReliabilityService
+from app.services.indexing_queue import DocumentIndexQueueUnavailable, get_document_index_queue
+from app.services.indexing_reliability_service import IndexingReliabilityService
 
 setup_logging()
 logger = get_logger(__name__)
@@ -44,6 +46,22 @@ def run() -> None:
             logger.exception("Analysis maintenance cycle failed")
         finally:
             db.close()
+        indexing_db = get_session_factory()()
+        try:
+            result = IndexingReliabilityService(indexing_db, settings).tick(
+                get_document_index_queue()
+            )
+            if any(result.values()):
+                logger.info(
+                    "Document indexing maintenance repaired work",
+                    extra={"indexing_maintenance": result},
+                )
+        except DocumentIndexQueueUnavailable as exc:
+            logger.warning("Document indexing maintenance deferred: %s", exc)
+        except Exception:
+            logger.exception("Document indexing maintenance cycle failed")
+        finally:
+            indexing_db.close()
         stopped.wait(settings.analysis_maintenance_poll_seconds)
     logger.info("Analysis maintenance loop stopped")
 

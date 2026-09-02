@@ -81,7 +81,11 @@ class MatrixExportService:
                 row.technical_error or "",
             ]
             for column, value in enumerate(values, start=1):
-                cell = sheet.cell(row=row_index, column=column, value=value)
+                cell = sheet.cell(
+                    row=row_index,
+                    column=column,
+                    value=self._safe_text(value),
+                )
                 cell.font = Font(name="Arial")
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
 
@@ -118,6 +122,10 @@ class MatrixExportService:
         return "\n\n".join(values)
 
     @staticmethod
+    def _safe_text(value: str) -> str:
+        return f"'{value}" if value.startswith("=") else value
+
+    @staticmethod
     def _write_metadata(
         sheet,
         review: ReviewPackage,
@@ -145,7 +153,11 @@ class MatrixExportService:
             )
         for row_index, (key, value) in enumerate(values, start=1):
             key_cell = sheet.cell(row=row_index, column=1, value=key)
-            value_cell = sheet.cell(row=row_index, column=2, value=str(value or ""))
+            value_cell = sheet.cell(
+                row=row_index,
+                column=2,
+                value=MatrixExportService._safe_text(str(value or "")),
+            )
             key_cell.font = Font(name="Arial", bold=True)
             value_cell.font = Font(name="Arial")
             value_cell.alignment = Alignment(wrap_text=True, vertical="top")

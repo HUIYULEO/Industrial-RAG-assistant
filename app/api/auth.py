@@ -8,12 +8,12 @@ from sqlalchemy.orm import Session
 
 from app.api.schemas import AuthConfigResponse, AuthUserResponse, LoginRequest, LoginResponse, RegisterRequest
 from app.core.config import get_settings
-from app.repositories.database import get_db
+from app.repositories.database import get_db, get_session_factory
 from app.services.auth_service import AuthService, AuthenticatedUser
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 bearer_scheme = HTTPBearer(auto_error=False)
-DbSession = Annotated[Session, Depends(get_db)]
+DbSession = Annotated[Session, Depends(get_db, scope="function")]
 
 
 def user_response(user: AuthenticatedUser) -> AuthUserResponse:
@@ -27,23 +27,36 @@ def user_response(user: AuthenticatedUser) -> AuthUserResponse:
 
 
 def require_authenticated_user(
-    db: DbSession,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
 ) -> AuthenticatedUser:
     settings = get_settings()
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in is required")
+    db = get_session_factory()()
     try:
         return AuthService(db, settings).authenticate_token(credentials.credentials)
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+    finally:
+        db.close()
+
+
+def require_admin_user(
+    user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+) -> AuthenticatedUser:
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access is required",
+        )
+    return user
 
 
 @router.get("/config", response_model=AuthConfigResponse)
 def auth_config():
     settings = get_settings()
     return AuthConfigResponse(
-        authentication_required=settings.auth_required,
+        authentication_required=True,
         self_registration_enabled=settings.allow_self_registration,
         visual_analysis_enabled=settings.enable_visual_analysis,
         departments=list(AuthService.DEPARTMENTS),

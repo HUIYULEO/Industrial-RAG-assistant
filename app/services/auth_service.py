@@ -142,6 +142,8 @@ class AuthService:
         if existing:
             existing.organization_id = organization.id
             existing.role = "admin"
+            if not verify_password(password, existing.password_hash):
+                existing.password_hash = hash_password(password)
             return
         self.db.add(
             User(
