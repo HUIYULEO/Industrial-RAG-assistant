@@ -29,7 +29,13 @@ from app.services.coverage_service import (
     CoverageAnalysisService,
 )
 from app.services.visual_evidence_service import VisualAnalysis, VisualEvidenceService
-from app.services.design_review_chat_service import PreparedAnswer
+from app.services.design_review_chat_service import (
+    DesignReviewChatService,
+    GroundedAnswer,
+    NormalizedQuery,
+    PreparedAnswer,
+    UNVERIFIED_CITATIONS_LIMITATION,
+)
 from app.services.analysis_queue import get_analysis_queue
 from app.services.analysis_reliability_service import AnalysisReliabilityService
 from app.core.config import get_settings
@@ -85,7 +91,7 @@ def test_document_responses_do_not_expose_storage_paths(review_client: TestClien
     assert "storage_path" not in document
 
 
-def test_evidence_chat_streams_tokens_then_final_citations(review_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+def test_evidence_chat_streams_tokens_without_unverified_citations(review_client: TestClient, monkeypatch: pytest.MonkeyPatch):
     from app.api.routes import chat as chat_routes
     from app.main import app
 
@@ -127,7 +133,68 @@ def test_evidence_chat_streams_tokens_then_final_citations(review_client: TestCl
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'event: token\ndata: {"text": "Task dispatch records "}' in response.text
     assert 'event: final' in response.text
-    assert '"chunk_id": "chunk-001"' in response.text
+    assert '"citations": []' in response.text
+    assert UNVERIFIED_CITATIONS_LIMITATION in response.text
+
+
+def test_chat_api_does_not_expose_invalid_non_streaming_citations(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.api.routes import chat as chat_routes
+    from app.main import app
+
+    evidence = EvidenceChunk(
+        chunk_id="chunk-001",
+        document_version_id="version-1",
+        document_title="Fleet Manager FS",
+        document_type="FS",
+        version="1.0",
+        page=3,
+        section="Retention",
+        content="Task dispatch records are retained for 90 days.",
+    )
+
+    class FakeRetrieval:
+        def retrieve(self, *_args, **_kwargs):
+            return [evidence]
+
+    class FakeNormalizer:
+        def normalize(self, *_args, **_kwargs):
+            return NormalizedQuery(retrieval_query="retention period")
+
+    class FakeGenerator:
+        def generate(self, **_kwargs):
+            return GroundedAnswer(
+                answer="Task dispatch records are retained.",
+                evidence_chunk_ids=["unknown-chunk"],
+            )
+
+    class FakeReviewService:
+        def get_review_package(self, _review_id):
+            return SimpleNamespace(
+                system="fleet_manager",
+                document_links=[SimpleNamespace(document_version_id="version-1")],
+            )
+
+    service = DesignReviewChatService(
+        FakeRetrieval(), FakeNormalizer(), FakeGenerator()
+    )
+    monkeypatch.setattr(chat_routes, "scoped_review_service", lambda *_: FakeReviewService())
+    app.dependency_overrides[build_design_review_chat_service] = lambda: service
+    try:
+        response = review_client.post(
+            "/design-review/chat",
+            json={
+                "question": "How long are records retained?",
+                "review_package_id": "review-1",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(build_design_review_chat_service, None)
+
+    assert response.status_code == 200
+    assert response.json()["citations"] == []
+    assert response.json()["limitations"] == UNVERIFIED_CITATIONS_LIMITATION
 
 
 @pytest.mark.asyncio

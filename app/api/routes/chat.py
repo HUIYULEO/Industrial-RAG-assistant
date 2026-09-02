@@ -10,7 +10,10 @@ from app.api.dependencies import CurrentUser, DesignReviewChatDependency, scoped
 from app.api.schemas import ReviewChatCitation, ReviewChatRequest, ReviewChatResponse
 from app.core.logging_config import get_logger
 from app.repositories.database import get_session_factory
-from app.services.design_review_chat_service import GroundedAnswer
+from app.services.design_review_chat_service import (
+    GroundedAnswer,
+    UNVERIFIED_CITATIONS_LIMITATION,
+)
 
 router = APIRouter(tags=["evidence-chat"], dependencies=[Depends(require_authenticated_user)])
 logger = get_logger(__name__)
@@ -122,8 +125,11 @@ def stream_design_review_chat(
             else:
                 if not answer_text:
                     raise ValueError("The language model returned an empty answer.")
-                final_answer = GroundedAnswer(answer=answer_text)
-                citations = prepared.evidence[:3]
+                final_answer = GroundedAnswer(
+                    answer=answer_text,
+                    limitations=UNVERIFIED_CITATIONS_LIMITATION,
+                )
+                citations = []
             yield sse_event(
                 "final",
                 chat_response(
