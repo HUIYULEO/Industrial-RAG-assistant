@@ -16,6 +16,10 @@ from app.repositories.database import get_db
 from app.services.auth_service import AuthenticatedUser
 from app.services.design_review_chat_service import DesignReviewChatService
 from app.services.indexing_service import DocumentIndexSubmissionService
+from app.services.ingestion_queue import (
+    DocumentIngestionQueue,
+    get_document_ingestion_queue,
+)
 from app.services.ingestion_service import DocumentIngestionService
 from app.services.review_service import ReviewService
 from app.services.visual_evidence_service import VisualEvidenceService, VisualInterpreter
@@ -37,6 +41,9 @@ def get_visual_evidence_service(db: DbSession) -> VisualEvidenceService:
 
 
 DocumentIngestionDependency = Annotated[DocumentIngestionService, Depends(get_document_ingestion_service)]
+DocumentIngestionQueueDependency = Annotated[
+    DocumentIngestionQueue, Depends(get_document_ingestion_queue)
+]
 DocumentIndexSubmissionDependency = Annotated[
     DocumentIndexSubmissionService, Depends(get_document_index_submission_service)
 ]

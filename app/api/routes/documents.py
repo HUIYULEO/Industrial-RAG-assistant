@@ -11,6 +11,7 @@ from app.api.auth import require_admin_user, require_authenticated_user
 from app.api.dependencies import (
     CurrentUser,
     DbSession,
+    DocumentIngestionQueueDependency,
     DocumentIndexSubmissionDependency,
     DocumentIngestionDependency,
     VisualEvidenceDependency,
@@ -27,6 +28,7 @@ from app.api.schemas import (
 )
 from app.core.config import get_settings
 from app.core.logging_config import get_logger
+from app.services.ingestion_queue import DocumentIngestionQueueUnavailable
 from app.services.review_service import ReviewService
 
 router = APIRouter(tags=["documents"], dependencies=[Depends(require_authenticated_user)])
@@ -89,11 +91,13 @@ def archive_document(document_version_id: str, payload: DocumentArchiveRequest, 
 @router.post(
     "/documents/{document_version_id}/upload",
     response_model=DocumentVersionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_admin_user)],
 )
 async def upload_document(
     document_version_id: str,
     ingestion: DocumentIngestionDependency,
+    ingestion_queue: DocumentIngestionQueueDependency,
     file: UploadFile = File(...),
     pdf_password: str | None = Form(default=None),
 ):
@@ -104,37 +108,62 @@ async def upload_document(
         raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_size_mb} MB limit")
     try:
         item = await run_in_threadpool(
-            ingestion.upload_and_parse,
+            ingestion.stage_upload,
             document_version_id,
             file.filename or "",
             content,
             pdf_password=pdf_password,
         )
+        ingestion_queue.enqueue(document_version_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DocumentIngestionQueueUnavailable as exc:
+        ingestion.mark_staged_parse_failed(document_version_id, str(exc))
+        logger.exception(
+            "Document parsing submission failed for document %s",
+            document_version_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Document parsing is temporarily unavailable.",
+        ) from exc
     return document_response(item)
 
 
 @router.post(
     "/documents/{document_version_id}/reparse",
     response_model=DocumentVersionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_admin_user)],
 )
 def reparse_document(
     document_version_id: str,
     ingestion: DocumentIngestionDependency,
+    ingestion_queue: DocumentIngestionQueueDependency,
     pdf_password: str | None = Form(default=None),
 ):
     try:
-        item = ingestion.reparse_stored_document(
+        item = ingestion.stage_reparse(
             document_version_id, pdf_password=pdf_password
         )
+        ingestion_queue.enqueue(document_version_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        status_code = 409 if "already being parsed" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except DocumentIngestionQueueUnavailable as exc:
+        ingestion.mark_staged_parse_failed(document_version_id, str(exc))
+        logger.exception(
+            "Document reparsing submission failed for document %s",
+            document_version_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Document parsing is temporarily unavailable.",
+        ) from exc
     return document_response(item)
 
 
