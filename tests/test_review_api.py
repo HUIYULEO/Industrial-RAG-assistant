@@ -29,6 +29,7 @@ from app.services.coverage_service import (
     CoverageAnalysisService,
 )
 from app.services.visual_evidence_service import VisualAnalysis, VisualEvidenceService
+from app.services.ingestion_queue import get_document_ingestion_queue
 from app.services.design_review_chat_service import (
     DesignReviewChatService,
     GroundedAnswer,
@@ -79,6 +80,14 @@ def create_design_document(client: TestClient, *, document_type: str = "FS", ver
     )
     assert response.status_code == 201
     return response.json()["id"]
+
+
+def get_document_version(client: TestClient, document_version_id: str) -> dict:
+    return next(
+        item
+        for item in client.get("/documents").json()
+        if item["id"] == document_version_id
+    )
 
 
 def test_document_responses_do_not_expose_storage_paths(review_client: TestClient):
@@ -375,7 +384,8 @@ def test_frozen_document_cannot_be_uploaded_or_reparsed(review_client: TestClien
         f"/documents/{version_id}/upload",
         files={"file": ("source.csv", b"interface,owner\nWCS API,Automation\n", "text/csv")},
     )
-    assert uploaded.status_code == 200
+    assert uploaded.status_code == 202
+    assert uploaded.json()["ingestion_status"] == "parsing"
     baseline = review_client.post(
         "/requirement-baselines", json={"name": "Ingestion guard URS", "system": "fleet_manager"}
     ).json()
@@ -421,7 +431,8 @@ def test_active_index_prevents_upload_and_reparse(
         f"/documents/{version_id}/upload",
         files={"file": ("source.csv", b"interface,owner\nWCS API,Automation\n", "text/csv")},
     )
-    assert uploaded.status_code == 200
+    assert uploaded.status_code == 202
+    assert uploaded.json()["ingestion_status"] == "parsing"
     with database.get_session_factory()() as db:
         version = db.get(DocumentVersion, version_id)
         version.ingestion_status = ingestion_status
@@ -534,8 +545,9 @@ def test_document_index_submission_returns_accepted_without_running_embeddings(
             )
         },
     )
-    assert uploaded.status_code == 200
-    assert uploaded.json()["ingestion_status"] == "parsed_pending_index"
+    assert uploaded.status_code == 202
+    assert uploaded.json()["ingestion_status"] == "parsing"
+    assert get_document_version(review_client, version_id)["ingestion_status"] == "parsed_pending_index"
 
     queued = review_client.post(f"/documents/{version_id}/index")
 
@@ -1081,8 +1093,11 @@ def test_pdf_upload_rejects_non_extractable_document(review_client: TestClient, 
         f"/documents/{version_id}/upload",
         files={"file": ("empty.pdf", pdf_path.read_bytes(), "application/pdf")},
     )
-    assert response.status_code == 400
-    assert "No extractable text" in response.json()["detail"]
+    assert response.status_code == 202
+    assert response.json()["ingestion_status"] == "parsing"
+    failed = get_document_version(review_client, version_id)
+    assert failed["ingestion_status"] == "failed"
+    assert "No extractable text" in failed["ingestion_error"]
 
 
 def test_encrypted_pdf_requires_and_accepts_a_one_time_password(review_client: TestClient, tmp_path: Path):
@@ -1115,8 +1130,9 @@ def test_encrypted_pdf_requires_and_accepts_a_one_time_password(review_client: T
         files={"file": ("protected.pdf", encrypted_pdf, "application/pdf")},
         data={"pdf_password": "supplier-password"},
     )
-    assert accepted.status_code == 200
-    assert accepted.json()["ingestion_status"] == "parsed_pending_index"
+    assert accepted.status_code == 202
+    assert accepted.json()["ingestion_status"] == "parsing"
+    assert get_document_version(review_client, password_version)["ingestion_status"] == "parsed_pending_index"
 
 
 def test_pdf_visual_evidence_is_rendered_before_explicit_analysis(
@@ -1137,7 +1153,8 @@ def test_pdf_visual_evidence_is_rendered_before_explicit_analysis(
         f"/documents/{version_id}/upload",
         files={"file": ("fleet_manager_interface.pdf", source_pdf, "application/pdf")},
     )
-    assert upload.status_code == 200
+    assert upload.status_code == 202
+    assert upload.json()["ingestion_status"] == "parsing"
 
     figures = review_client.get(f"/documents/{version_id}/figures")
     assert figures.status_code == 200
@@ -1207,10 +1224,11 @@ def test_optional_visual_candidate_failure_does_not_fail_upload_or_reparse(
     )
     reparsed = review_client.post(f"/documents/{version_id}/reparse")
 
-    assert uploaded.status_code == 200
-    assert uploaded.json()["ingestion_status"] == "parsed_pending_index"
-    assert reparsed.status_code == 200
-    assert reparsed.json()["ingestion_status"] == "parsed_pending_index"
+    assert uploaded.status_code == 202
+    assert uploaded.json()["ingestion_status"] == "parsing"
+    assert reparsed.status_code == 202
+    assert reparsed.json()["ingestion_status"] == "parsing"
+    assert get_document_version(review_client, version_id)["ingestion_status"] == "parsed_pending_index"
     chunks = review_client.get(f"/documents/{version_id}/chunks").json()
     assert any("WCS sends tasks" in chunk["content"] for chunk in chunks)
 
@@ -1238,7 +1256,8 @@ def test_docx_upload_preserves_heading_and_table_row_sources(review_client: Test
             )
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert response.json()["ingestion_status"] == "parsing"
     chunks = review_client.get(f"/documents/{version_id}/chunks").json()
     assert any("4.2 Zone reservation" in (chunk["section"] or "") for chunk in chunks)
     assert any("Retention: 90 days" in chunk["content"] for chunk in chunks)
@@ -1256,14 +1275,15 @@ def test_csv_upload_preserves_rows_as_citable_chunks(review_client: TestClient):
             )
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert response.json()["ingestion_status"] == "parsing"
     chunks = review_client.get(f"/documents/{version_id}/chunks").json()
     assert len(chunks) == 2
     assert chunks[0]["section"] == "CSV row 1"
     assert "owner: Automation" in chunks[0]["content"]
 
 
-def test_upload_parsing_runs_in_threadpool(
+def test_upload_staging_runs_in_threadpool(
     review_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
     from app.api.routes import documents as document_routes
@@ -1282,8 +1302,135 @@ def test_upload_parsing_runs_in_threadpool(
         files={"file": ("source.csv", b"interface,owner\nWCS API,Automation\n", "text/csv")},
     )
 
-    assert response.status_code == 200
-    assert calls == ["upload_and_parse"]
+    assert response.status_code == 202
+    assert response.json()["ingestion_status"] == "parsing"
+    assert calls == ["stage_upload"]
+
+
+def test_upload_and_reparse_return_before_the_queued_parser_runs(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.main import app
+
+    class RecordingQueue:
+        def __init__(self):
+            self.document_ids = []
+
+        def enqueue(self, document_version_id):
+            self.document_ids.append(document_version_id)
+
+    queue = RecordingQueue()
+    app.dependency_overrides[get_document_ingestion_queue] = lambda: queue
+    version_id = create_design_document(review_client)
+    try:
+        uploaded = review_client.post(
+            f"/documents/{version_id}/upload",
+            files={
+                "file": (
+                    "source.csv",
+                    b"interface,owner\nWCS API,Automation\n",
+                    "text/csv",
+                )
+            },
+        )
+        reparsed_while_active = review_client.post(
+            f"/documents/{version_id}/reparse"
+        )
+    finally:
+        app.dependency_overrides.pop(get_document_ingestion_queue, None)
+
+    assert uploaded.status_code == 202
+    assert uploaded.json()["id"] == version_id
+    assert uploaded.json()["ingestion_status"] == "parsing"
+    assert queue.document_ids == [version_id]
+    assert reparsed_while_active.status_code == 409
+    assert get_document_version(review_client, version_id)["ingestion_status"] == "parsing"
+
+
+def test_ingestion_worker_uses_and_closes_its_own_session(monkeypatch):
+    from app.workers import ingestion_worker
+
+    calls = []
+
+    class FakeSession:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeIngestion:
+        def __init__(self, session):
+            self.session = session
+
+        def parse_staged_document(self, document_version_id):
+            calls.append((self.session, document_version_id))
+
+    session = FakeSession()
+    monkeypatch.setattr(
+        ingestion_worker,
+        "get_session_factory",
+        lambda: lambda: session,
+    )
+    monkeypatch.setattr(
+        ingestion_worker,
+        "build_document_ingestion_service",
+        FakeIngestion,
+    )
+
+    ingestion_worker.execute_document_ingestion("document-1")
+
+    assert calls == [(session, "document-1")]
+    assert session.closed is True
+
+
+def test_redis_ingestion_queue_reuses_document_worker_without_storing_password(
+    monkeypatch,
+):
+    import rq
+    from redis import Redis
+
+    from app.core.config import Settings
+    from app.services.ingestion_queue import RedisDocumentIngestionQueue
+
+    captured = {}
+
+    class FakeRedis:
+        def ping(self):
+            captured["pinged"] = True
+
+    class FakeQueue:
+        def __init__(self, name, *, connection):
+            captured["queue"] = (name, connection)
+
+        def enqueue(self, function_path, document_version_id, **kwargs):
+            captured["job"] = (function_path, document_version_id, kwargs)
+
+    connection = FakeRedis()
+    settings = Settings(_env_file=None, analysis_queue_backend="redis")
+    monkeypatch.setattr(
+        Redis,
+        "from_url",
+        staticmethod(
+            lambda url, **kwargs: (
+                captured.update(connection=(url, kwargs)) or connection
+            )
+        ),
+    )
+    monkeypatch.setattr(rq, "Queue", FakeQueue)
+
+    RedisDocumentIngestionQueue(settings).enqueue("document-1")
+
+    assert captured["connection"] == (
+        settings.redis_url,
+        {"socket_connect_timeout": 1, "socket_timeout": 1},
+    )
+    assert captured["pinged"] is True
+    assert captured["queue"] == (settings.document_index_queue_name, connection)
+    function_path, document_version_id, kwargs = captured["job"]
+    assert function_path == "app.workers.ingestion_worker.execute_document_ingestion"
+    assert document_version_id == "document-1"
+    assert kwargs["job_timeout"] == settings.document_index_job_timeout_seconds
+    assert "password" not in repr(kwargs).lower()
 
 
 def test_upload_reads_only_one_byte_beyond_configured_limit(
@@ -1379,6 +1526,7 @@ async def test_upload_file_read_is_bounded_to_limit_plus_one(monkeypatch: pytest
         await document_routes.upload_document(
             "document-version-1",
             ingestion=object(),  # type: ignore[arg-type]
+            ingestion_queue=object(),  # type: ignore[arg-type]
             file=FakeUpload(),  # type: ignore[arg-type]
             pdf_password=None,
         )
@@ -1399,7 +1547,8 @@ def test_citation_reader_returns_the_requested_passage_in_source_order(review_cl
             )
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert response.json()["ingestion_status"] == "parsing"
     chunks = review_client.get(f"/documents/{version_id}/chunks").json()
 
     context = review_client.get(f"/documents/{version_id}/chunks/{chunks[1]['id']}/context")
@@ -1425,7 +1574,8 @@ def test_original_pdf_source_is_available_for_the_in_app_page_viewer(review_clie
         f"/documents/{version_id}/upload",
         files={"file": ("fleet_manager.pdf", source_bytes, "application/pdf")},
     )
-    assert uploaded.status_code == 200
+    assert uploaded.status_code == 202
+    assert uploaded.json()["ingestion_status"] == "parsing"
 
     response = review_client.get(f"/documents/{version_id}/source")
 
@@ -1450,14 +1600,17 @@ def test_stored_document_can_be_reparsed_with_the_current_chunk_configuration(re
         f"/documents/{version_id}/upload",
         files={"file": ("fleet_manager.pdf", content, "application/pdf")},
     )
-    assert uploaded.status_code == 200
-    assert uploaded.json()["chunk_count"] == 1
+    assert uploaded.status_code == 202
+    assert uploaded.json()["ingestion_status"] == "parsing"
+    assert get_document_version(review_client, version_id)["chunk_count"] == 1
 
     reparsed = review_client.post(f"/documents/{version_id}/reparse")
 
-    assert reparsed.status_code == 200
-    assert reparsed.json()["ingestion_status"] == "parsed_pending_index"
-    assert reparsed.json()["chunk_count"] == 1
+    assert reparsed.status_code == 202
+    assert reparsed.json()["ingestion_status"] == "parsing"
+    persisted = get_document_version(review_client, version_id)
+    assert persisted["ingestion_status"] == "parsed_pending_index"
+    assert persisted["chunk_count"] == 1
     chunks = review_client.get(f"/documents/{version_id}/chunks").json()
     assert all(chunk["page"] == 1 for chunk in chunks)
 

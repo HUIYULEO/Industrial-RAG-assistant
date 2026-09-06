@@ -99,6 +99,8 @@ class DocumentIngestionService:
             raise ValueError(
                 "A document version in a frozen Review Package cannot be uploaded or reparsed"
             )
+        if version.ingestion_status == "parsing":
+            raise ValueError("A document version already being parsed cannot be uploaded or reparsed")
         if version.ingestion_status in {"index_queued", "indexing"}:
             raise ValueError(
                 "A document version queued for or undergoing indexing cannot be uploaded or reparsed"
@@ -123,7 +125,44 @@ class DocumentIngestionService:
             f"{suffix[1:].upper()} parsing failed: {original_error}"
         ) from original_error
 
-    def upload_and_parse(
+    @staticmethod
+    def _staged_pdf_path(source_path: Path) -> Path:
+        return source_path.with_name(f".{source_path.name}.parsing.pdf")
+
+    def _prepare_pdf_for_background(
+        self, source_path: Path, pdf_password: str | None
+    ) -> None:
+        """Validate encrypted PDFs without persisting their one-time password."""
+        staged_path = self._staged_pdf_path(source_path)
+        staged_path.unlink(missing_ok=True)
+        with fitz.open(str(source_path)) as document:
+            if not document.needs_pass:
+                return
+            if not document.authenticate(pdf_password or ""):
+                if pdf_password:
+                    raise ValueError(
+                        "The PDF password is incorrect or cannot open this encrypted PDF"
+                    )
+                raise ValueError(
+                    "This PDF is encrypted. Enter its password to parse it; the password is not stored"
+                )
+            document.save(staged_path, encryption=fitz.PDF_ENCRYPT_NONE)
+
+    def _stored_source_path(self, version: DocumentVersion) -> Path:
+        if not version.storage_path:
+            raise ValueError(
+                "The original uploaded file is unavailable; upload the document again to parse it"
+            )
+        source_path = Path(version.storage_path)
+        if not source_path.is_file():
+            raise ValueError(
+                "The original uploaded file is unavailable; upload the document again to parse it"
+            )
+        if source_path.suffix.lower() not in self.supported_extensions:
+            raise ValueError("Stored source format is no longer supported")
+        return source_path
+
+    def stage_upload(
         self,
         document_version_id: str,
         filename: str,
@@ -131,6 +170,7 @@ class DocumentIngestionService:
         *,
         pdf_password: str | None = None,
     ) -> DocumentVersion:
+        """Persist a source and commit the parsing state before job submission."""
         version = self.db.get(DocumentVersion, document_version_id)
         if version is None:
             raise LookupError("Document version not found")
@@ -153,116 +193,135 @@ class DocumentIngestionService:
             version.storage_path = str(target_path)
             version.ingestion_status = "parsing"
             version.ingestion_error = None
-            self.db.commit()
-            parsed_chunks, source_units = self._parse_source(target_path, suffix, pdf_password=pdf_password)
-        except Exception as exc:
-            self._raise_ingestion_failure(version.id, suffix, exc)
-
-        try:
-            self.db.execute(delete(DocumentChunk).where(DocumentChunk.document_version_id == version.id))
-            for index, chunk in enumerate(parsed_chunks):
-                self.db.add(
-                    DocumentChunk(
-                        document_version_id=version.id,
-                        chunk_index=index,
-                        page=chunk.page,
-                        section=chunk.section,
-                        element_type=chunk.element_type,
-                        source_metadata=chunk.source_metadata,
-                        content=chunk.content,
-                        content_hash=hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
-                    )
-                )
-            # For PDF this is pages; for DOCX it is structural blocks and for CSV rows.
-            version.page_count = source_units
-            version.chunk_count = len(parsed_chunks)
-            # The relational record is ready; the next increment adds Milvus vectors.
-            version.ingestion_status = "parsed_pending_index"
+            if suffix == ".pdf":
+                self._prepare_pdf_for_background(target_path, pdf_password)
             self.db.commit()
         except Exception as exc:
+            self._staged_pdf_path(target_path).unlink(missing_ok=True)
             self._raise_ingestion_failure(version.id, suffix, exc)
-
-        if suffix == ".pdf":
-            try:
-                # Candidate pages are rendered locally but are not sent to an LLM
-                # or indexed until an engineer explicitly requests analysis.
-                VisualEvidenceService(self.db, self.data_dir).extract_pdf_candidates(
-                    version.id, target_path, pdf_password=pdf_password
-                )
-            except Exception:
-                self.db.rollback()
-                logger.warning(
-                    "Optional PDF visual candidate extraction failed after text ingestion",
-                    extra={"document_version_id": version.id},
-                    exc_info=True,
-                )
-
         self.db.refresh(version)
         return version
 
-    def reparse_stored_document(
+    def stage_reparse(
         self, document_version_id: str, *, pdf_password: str | None = None
     ) -> DocumentVersion:
-        """Rebuild citable chunks from the original locally stored source file."""
+        """Validate a stored source and commit a new parsing state."""
         version = self.db.get(DocumentVersion, document_version_id)
         if version is None:
             raise LookupError("Document version not found")
         self._ensure_version_can_be_modified(version)
-        if not version.storage_path:
-            raise ValueError("The original uploaded file is unavailable; upload the document again to parse it")
-
-        source_path = Path(version.storage_path)
-        if not source_path.is_file():
-            raise ValueError("The original uploaded file is unavailable; upload the document again to parse it")
-        suffix = source_path.suffix.lower()
-        if suffix not in self.supported_extensions:
-            raise ValueError("Stored source format is no longer supported")
-
+        source_path = self._stored_source_path(version)
         try:
+            if source_path.suffix.lower() == ".pdf":
+                self._prepare_pdf_for_background(source_path, pdf_password)
             version.ingestion_status = "parsing"
             version.ingestion_error = None
             self.db.commit()
-            parsed_chunks, source_units = self._parse_source(source_path, suffix, pdf_password=pdf_password)
         except Exception as exc:
-            self._raise_ingestion_failure(version.id, suffix, exc)
-
-        try:
-            self.db.execute(delete(DocumentChunk).where(DocumentChunk.document_version_id == version.id))
-            for index, chunk in enumerate(parsed_chunks):
-                self.db.add(
-                    DocumentChunk(
-                        document_version_id=version.id,
-                        chunk_index=index,
-                        page=chunk.page,
-                        section=chunk.section,
-                        element_type=chunk.element_type,
-                        source_metadata=chunk.source_metadata,
-                        content=chunk.content,
-                        content_hash=hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
-                    )
-                )
-            version.page_count = source_units
-            version.chunk_count = len(parsed_chunks)
-            version.ingestion_status = "parsed_pending_index"
-            self.db.commit()
-        except Exception as exc:
-            self._raise_ingestion_failure(version.id, suffix, exc)
-
-        if suffix == ".pdf":
-            try:
-                VisualEvidenceService(self.db, self.data_dir).extract_pdf_candidates(
-                    version.id, source_path, pdf_password=pdf_password
-                )
-            except Exception:
-                self.db.rollback()
-                logger.warning(
-                    "Optional PDF visual candidate extraction failed after text reparse",
-                    extra={"document_version_id": version.id},
-                    exc_info=True,
-                )
-
+            self._staged_pdf_path(source_path).unlink(missing_ok=True)
+            self._raise_ingestion_failure(version.id, source_path.suffix.lower(), exc)
         self.db.refresh(version)
         return version
+
+    def parse_staged_document(self, document_version_id: str) -> DocumentVersion:
+        """Run parsing in a worker after the request Session has been released."""
+        version = self.db.get(DocumentVersion, document_version_id)
+        if version is None:
+            raise LookupError("Document version not found")
+        source_path = self._stored_source_path(version)
+        suffix = source_path.suffix.lower()
+        staged_pdf_path = self._staged_pdf_path(source_path)
+        parse_path = staged_pdf_path if suffix == ".pdf" and staged_pdf_path.is_file() else source_path
+
+        try:
+            try:
+                parsed_chunks, source_units = self._parse_source(parse_path, suffix)
+            except Exception as exc:
+                self._raise_ingestion_failure(version.id, suffix, exc)
+
+            try:
+                self.db.execute(
+                    delete(DocumentChunk).where(
+                        DocumentChunk.document_version_id == version.id
+                    )
+                )
+                for index, chunk in enumerate(parsed_chunks):
+                    self.db.add(
+                        DocumentChunk(
+                            document_version_id=version.id,
+                            chunk_index=index,
+                            page=chunk.page,
+                            section=chunk.section,
+                            element_type=chunk.element_type,
+                            source_metadata=chunk.source_metadata,
+                            content=chunk.content,
+                            content_hash=hashlib.sha256(
+                                chunk.content.encode("utf-8")
+                            ).hexdigest(),
+                        )
+                    )
+                version.page_count = source_units
+                version.chunk_count = len(parsed_chunks)
+                version.ingestion_status = "parsed_pending_index"
+                self.db.commit()
+            except Exception as exc:
+                self._raise_ingestion_failure(version.id, suffix, exc)
+
+            if suffix == ".pdf":
+                try:
+                    VisualEvidenceService(self.db, self.data_dir).extract_pdf_candidates(
+                        version.id, parse_path
+                    )
+                except Exception:
+                    self.db.rollback()
+                    logger.warning(
+                        "Optional PDF visual candidate extraction failed after text ingestion",
+                        extra={"document_version_id": version.id},
+                        exc_info=True,
+                    )
+
+            self.db.refresh(version)
+            return version
+        finally:
+            staged_pdf_path.unlink(missing_ok=True)
+
+    def mark_staged_parse_failed(
+        self, document_version_id: str, error_message: str
+    ) -> None:
+        """Make a failed queue submission visible instead of leaving parsing stuck."""
+        self.db.rollback()
+        version = self.db.get(DocumentVersion, document_version_id)
+        if version is None or version.ingestion_status != "parsing":
+            return
+        if version.storage_path:
+            self._staged_pdf_path(Path(version.storage_path)).unlink(missing_ok=True)
+        version.ingestion_status = "failed"
+        version.ingestion_error = error_message
+        self.db.commit()
+
+    def upload_and_parse(
+        self,
+        document_version_id: str,
+        filename: str,
+        content: bytes,
+        *,
+        pdf_password: str | None = None,
+    ) -> DocumentVersion:
+        """Synchronous compatibility helper for scripts and service unit tests."""
+        self.stage_upload(
+            document_version_id,
+            filename,
+            content,
+            pdf_password=pdf_password,
+        )
+        return self.parse_staged_document(document_version_id)
+
+    def reparse_stored_document(
+        self, document_version_id: str, *, pdf_password: str | None = None
+    ) -> DocumentVersion:
+        """Synchronous compatibility helper for scripts and service unit tests."""
+        self.stage_reparse(document_version_id, pdf_password=pdf_password)
+        return self.parse_staged_document(document_version_id)
 
     def list_chunks(self, document_version_id: str) -> list[DocumentChunk]:
         if self.db.get(DocumentVersion, document_version_id) is None:
