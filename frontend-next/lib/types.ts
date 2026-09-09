@@ -10,7 +10,7 @@ export type DocumentIngestionStatus =
   | "indexed"
   | "index_failed";
 export type DocumentVersion = {
-  id: string; title: string; document_type: string; system: string; vendor?: string | null; version: string;
+  id: string; document_id: string; title: string; document_type: string; system: string; vendor?: string | null; version: string;
   status: string; ingestion_status: DocumentIngestionStatus; ingestion_error?: string | null; chunk_count: number; page_count?: number | null;
   archived_at?: string | null; archived_by_user_id?: string | null; archived_reason?: string | null;
 };

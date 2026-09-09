@@ -14,9 +14,40 @@ __pycache__/
 .idea/
 
 
-#database files
+# Local data, evaluation artifacts, and generated analysis documents.
+reset-backups/
 data/
+docs/
+tests/fixtures/*
+!tests/fixtures/residual_risks_tables.json
 *.pdf
+
+# Local evaluation and diagnostic tooling.
+/app/services/hierarchical_retrieval.py
+/change_log.md
+/scripts/analyze_fm_optimized_review.py
+/scripts/analyze_trace_review.py
+/scripts/build_urs_traceability_report.py
+/scripts/compare_amr_paired_statistics.py
+/scripts/compare_fm_parser_retrieval.py
+/scripts/diagnose_review_run.py
+/scripts/map_eval_chunks.py
+/scripts/prepare_fm_parser_version.py
+/scripts/rerun_review_with_trace.py
+/scripts/run_amr_parent_aggregation_experiment.py
+/scripts/run_amr_strategy_a.py
+/scripts/run_amr_strategy_b.py
+/scripts/run_fm_evidence_selection_experiment.py
+/scripts/run_fm_optimized_review.py
+/scripts/run_hierarchy_ablation.py
+/scripts/validate_amr_eval_index.py
+/tests/test_amr_eval_dataset.py
+/tests/test_amr_urs_v2.py
+/tests/test_hierarchical_retrieval.py
+/tests/test_hierarchy_ablation.py
+/tests/test_review_diagnostic.py
+/tests/test_trace_review_tools.py
+/tests/test_urs_v3_eval_datasets.py
 
 #log files
 logs/

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.domain.models import DocumentChunk, DocumentIndexDispatchOutbox, DocumentVersion
 from app.domain.ports import DocumentChunkIndex
 from app.services.embedding_service import EmbeddingService
+from app.services.ingestion_service import build_embedding_text
 
 
 INDEX_QUEUEABLE_STATUSES = {"parsed_pending_index", "index_failed"}
@@ -162,7 +163,19 @@ class DocumentIndexingService:
                 (chunk for chunk in version.chunks if chunk.element_type != "diagnostic"),
                 key=lambda item: item.chunk_index,
             )
-            vectors = self._embed_texts([chunk.content for chunk in chunks])
+            vectors = self._embed_texts(
+                [
+                    build_embedding_text(
+                        chunk.content,
+                        section_path=(chunk.source_metadata or {}).get(
+                            "section_path", chunk.section or "Document"
+                        ),
+                        element_type=chunk.element_type,
+                        source_metadata=chunk.source_metadata,
+                    )
+                    for chunk in chunks
+                ]
+            )
             if len(vectors) != len(chunks):
                 raise ValueError("Embedding provider returned an unexpected number of vectors")
             records = [

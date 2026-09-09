@@ -48,6 +48,9 @@ def review_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     database.get_session_factory.cache_clear()
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'review.db'}")
     monkeypatch.setenv("ANALYSIS_QUEUE_BACKEND", "memory")
+    # Legacy workflow cases below assert the original top-10 contract. The
+    # new policy has dedicated API freezing and candidate-pool tests.
+    monkeypatch.setenv("REVIEW_EVIDENCE_SELECTION_POLICY", "ranked_chunks_v1")
     monkeypatch.setenv("AUTH_SECRET", "test-secret-that-is-long-enough")
     database.initialise_database()
     from app.main import app
@@ -79,7 +82,13 @@ def create_design_document(client: TestClient, *, document_type: str = "FS", ver
         },
     )
     assert response.status_code == 201
-    return response.json()["id"]
+    version_id = response.json()["id"]
+    # Most review tests start from a prepared indexed source; ingestion tests
+    # explicitly upload/reparse it before asserting processing behaviour.
+    with database.get_session_factory()() as db:
+        db.get(DocumentVersion, version_id).ingestion_status = "indexed"
+        db.commit()
+    return version_id
 
 
 def get_document_version(client: TestClient, document_version_id: str) -> dict:
@@ -125,6 +134,9 @@ def test_evidence_chat_streams_tokens_without_unverified_citations(review_client
             yield "are retained for 90 days."
 
     class FakeReviewService:
+        def ensure_review_ready(self, review):
+            pass
+
         def get_review_package(self, _):
             return SimpleNamespace(system="fleet_manager", document_links=[SimpleNamespace(document_version_id="version-1")])
 
@@ -179,6 +191,9 @@ def test_chat_api_does_not_expose_invalid_non_streaming_citations(
             )
 
     class FakeReviewService:
+        def ensure_review_ready(self, review):
+            pass
+
         def get_review_package(self, _review_id):
             return SimpleNamespace(
                 system="fleet_manager",
@@ -221,6 +236,9 @@ async def test_chat_closes_review_session_before_provider_and_stream_body(monkey
             self.closed = True
 
     class FakeReviewService:
+        def ensure_review_ready(self, review):
+            pass
+
         def get_review_package(self, _review_id):
             return SimpleNamespace(
                 system="fleet_manager",
@@ -299,6 +317,9 @@ def test_chat_unknown_errors_are_logged_and_hidden_for_http_and_stream(
             raise RuntimeError("provider credential leaked by stream adapter")
 
     class FakeReviewService:
+        def ensure_review_ready(self, review):
+            pass
+
         def get_review_package(self, _):
             return SimpleNamespace(
                 system="fleet_manager",
@@ -353,7 +374,7 @@ def test_document_archive_preserves_auditable_record(review_client: TestClient):
 
 def test_document_in_frozen_review_package_cannot_be_archived(review_client: TestClient):
     baseline = review_client.post(
-        "/requirement-baselines", json={"name": "Archive guard URS", "system": "fleet_manager"}
+        "/requirement-baselines", json={"name": "Archive guard URS", "system": "fleet_manager_wcs"}
     ).json()
     review_client.post(
         f"/requirement-baselines/{baseline['id']}/requirements/import",
@@ -364,7 +385,7 @@ def test_document_in_frozen_review_package_cannot_be_archived(review_client: Tes
         "/review-packages",
         json={
             "name": "Archive guard review",
-            "system": "fleet_manager",
+            "system": "fleet_manager_wcs",
             "requirement_baseline_id": baseline["id"],
             "design_document_version_ids": [version_id],
         },
@@ -386,8 +407,11 @@ def test_frozen_document_cannot_be_uploaded_or_reparsed(review_client: TestClien
     )
     assert uploaded.status_code == 202
     assert uploaded.json()["ingestion_status"] == "parsing"
+    with database.get_session_factory()() as db:
+        db.get(DocumentVersion, version_id).ingestion_status = "indexed"
+        db.commit()
     baseline = review_client.post(
-        "/requirement-baselines", json={"name": "Ingestion guard URS", "system": "fleet_manager"}
+        "/requirement-baselines", json={"name": "Ingestion guard URS", "system": "fleet_manager_wcs"}
     ).json()
     review_client.post(
         f"/requirement-baselines/{baseline['id']}/requirements/import",
@@ -403,7 +427,7 @@ def test_frozen_document_cannot_be_uploaded_or_reparsed(review_client: TestClien
         "/review-packages",
         json={
             "name": "Ingestion guard review",
-            "system": "fleet_manager",
+            "system": "fleet_manager_wcs",
             "requirement_baseline_id": baseline["id"],
             "design_document_version_ids": [version_id],
         },
@@ -452,7 +476,7 @@ def test_active_index_prevents_upload_and_reparse(
 
 def test_archived_document_cannot_be_added_to_a_new_review_package(review_client: TestClient):
     baseline = review_client.post(
-        "/requirement-baselines", json={"name": "Archived source URS", "system": "fleet_manager"}
+        "/requirement-baselines", json={"name": "Archived source URS", "system": "fleet_manager_wcs"}
     ).json()
     review_client.post(
         f"/requirement-baselines/{baseline['id']}/requirements/import",
@@ -467,7 +491,7 @@ def test_archived_document_cannot_be_added_to_a_new_review_package(review_client
         "/review-packages",
         json={
             "name": "Archived source review",
-            "system": "fleet_manager",
+            "system": "fleet_manager_wcs",
             "requirement_baseline_id": baseline["id"],
             "design_document_version_ids": [version_id],
         },
@@ -646,7 +670,7 @@ def test_visual_analysis_unknown_error_is_logged_with_document_id_and_hidden(
 
 def test_progress_reconciles_a_stale_run_after_all_items_settle(review_client: TestClient):
     baseline = review_client.post(
-        "/requirement-baselines", json={"name": "Reconciled status URS", "system": "fleet_manager"}
+        "/requirement-baselines", json={"name": "Reconciled status URS", "system": "fleet_manager_wcs"}
     ).json()
     review_client.post(
         f"/requirement-baselines/{baseline['id']}/requirements/import",
@@ -656,7 +680,7 @@ def test_progress_reconciles_a_stale_run_after_all_items_settle(review_client: T
         "/review-packages",
         json={
             "name": "Reconciled status review",
-            "system": "fleet_manager",
+            "system": "fleet_manager_wcs",
             "requirement_baseline_id": baseline["id"],
             "design_document_version_ids": [create_design_document(review_client)],
         },
@@ -698,7 +722,7 @@ def test_progress_requeues_items_when_their_rq_jobs_are_stale(review_client: Tes
     app.dependency_overrides[get_analysis_queue] = lambda: queue
     try:
         baseline = review_client.post(
-            "/requirement-baselines", json={"name": "Orphan recovery URS", "system": "fleet_manager"}
+            "/requirement-baselines", json={"name": "Orphan recovery URS", "system": "fleet_manager_wcs"}
         ).json()
         review_client.post(
             f"/requirement-baselines/{baseline['id']}/requirements/import",
@@ -708,7 +732,7 @@ def test_progress_requeues_items_when_their_rq_jobs_are_stale(review_client: Tes
             "/review-packages",
             json={
                 "name": "Orphan recovery review",
-                "system": "fleet_manager",
+                "system": "fleet_manager_wcs",
                 "requirement_baseline_id": baseline["id"],
                 "design_document_version_ids": [create_design_document(review_client)],
             },
@@ -746,7 +770,7 @@ def test_manual_retry_resets_cycle_attempts_and_preserves_attempt_history(
 ):
     baseline = review_client.post(
         "/requirement-baselines",
-        json={"name": "Retry cycle URS", "system": "fleet_manager"},
+        json={"name": "Retry cycle URS", "system": "fleet_manager_wcs"},
     ).json()
     review_client.post(
         f"/requirement-baselines/{baseline['id']}/requirements/import",
@@ -762,7 +786,7 @@ def test_manual_retry_resets_cycle_attempts_and_preserves_attempt_history(
         "/review-packages",
         json={
             "name": "Retry cycle review",
-            "system": "fleet_manager",
+            "system": "fleet_manager_wcs",
             "requirement_baseline_id": baseline["id"],
             "design_document_version_ids": [create_design_document(review_client)],
         },
@@ -1029,7 +1053,7 @@ def test_review_package_accepts_supported_design_specification_types(
 ):
     baseline = review_client.post(
         "/requirement-baselines",
-        json={"name": f"{document_type} acceptance URS", "system": "fleet_manager"},
+        json={"name": f"{document_type} acceptance URS", "system": "fleet_manager_wcs"},
     ).json()
     review_client.post(
         f"/requirement-baselines/{baseline['id']}/requirements/import",
@@ -1054,6 +1078,102 @@ def test_review_package_accepts_supported_design_specification_types(
     )
 
     assert response.status_code == 201
+
+
+def test_review_package_rejects_multiple_supplier_versions(review_client: TestClient):
+    baseline = review_client.post(
+        "/requirement-baselines",
+        json={"name": "Single version URS", "system": "fleet_manager_wcs"},
+    ).json()
+    review_client.post(
+        f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={
+            "file": (
+                "urs.csv",
+                b"requirement_code,requirement_text\nURS-001,The system shall retain task status history.\n",
+                "text/csv",
+            )
+        },
+    )
+    v1_id = create_design_document(review_client, version="1.0")
+    v2_id = create_design_document(review_client, version="2.0")
+
+    response = review_client.post(
+        "/review-packages",
+        json={
+            "name": "DR-multiple-versions",
+            "system": "fleet_manager_wcs",
+            "requirement_baseline_id": baseline["id"],
+            "design_document_version_ids": [v1_id, v2_id],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "A review package requires exactly one supplier document version"
+
+
+def test_document_chat_can_query_a_explicit_historical_version(
+    review_client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.main import app
+
+    v1_id = create_design_document(review_client, version="1.0")
+    v2 = review_client.post(
+        "/documents",
+        json={
+            "title": "Fleet Manager Functional Specification",
+            "document_type": "FS",
+            "system": "fleet_manager_wcs",
+            "vendor": "Demo Vendor",
+            "version": "2.0",
+            "status": "active",
+            "supersedes_version_id": v1_id,
+        },
+    ).json()
+    with database.get_session_factory()() as db:
+        db.get(DocumentVersion, v2["id"]).ingestion_status = "indexed"
+        db.commit()
+
+    citation = EvidenceChunk(
+        chunk_id="chunk-v1",
+        document_version_id=v1_id,
+        document_title="Fleet Manager Functional Specification",
+        document_type="FS",
+        version="1.0",
+        page=12,
+        section="History",
+        content="Version 1.0 retains task status history for 90 days.",
+    )
+    captured = {}
+
+    class FakeChat:
+        def answer(self, **kwargs):
+            captured.update(kwargs)
+            return GroundedAnswer(answer="Version 1.0 retains history for 90 days.", evidence_chunk_ids=["chunk-v1"]), [citation], "history retention"
+
+    app.dependency_overrides[build_design_review_chat_service] = lambda: FakeChat()
+    try:
+        response = review_client.post(
+            "/document-chat",
+            json={"question": "What did version 1.0 retain?", "document_version_ids": [v1_id]},
+        )
+    finally:
+        app.dependency_overrides.pop(build_design_review_chat_service, None)
+
+    assert response.status_code == 200
+    assert captured["document_version_ids"] == [v1_id]
+    assert captured["document_types"] == ["FS"]
+    assert response.json()["citations"] == [
+        {
+            "chunk_id": "chunk-v1",
+            "document_version_id": v1_id,
+            "document_title": "Fleet Manager Functional Specification",
+            "version": "1.0",
+            "page": 12,
+            "section": "History",
+            "excerpt": "Version 1.0 retains task status history for 90 days.",
+        }
+    ]
 
 
 def test_document_replacement_preserves_logical_document(review_client: TestClient):
@@ -1316,7 +1436,7 @@ def test_upload_and_reparse_return_before_the_queued_parser_runs(
         def __init__(self):
             self.document_ids = []
 
-        def enqueue(self, document_version_id):
+        def enqueue(self, document_version_id, dispatch_version):
             self.document_ids.append(document_version_id)
 
     queue = RecordingQueue()
@@ -1362,7 +1482,8 @@ def test_ingestion_worker_uses_and_closes_its_own_session(monkeypatch):
         def __init__(self, session):
             self.session = session
 
-        def parse_staged_document(self, document_version_id):
+        def parse_staged_document(self, document_version_id, expected_dispatch_version):
+            assert expected_dispatch_version == 1
             calls.append((self.session, document_version_id))
 
     session = FakeSession()
@@ -1377,7 +1498,7 @@ def test_ingestion_worker_uses_and_closes_its_own_session(monkeypatch):
         FakeIngestion,
     )
 
-    ingestion_worker.execute_document_ingestion("document-1")
+    ingestion_worker.execute_document_ingestion("document-1", 1)
 
     assert calls == [(session, "document-1")]
     assert session.closed is True
@@ -1402,7 +1523,8 @@ def test_redis_ingestion_queue_reuses_document_worker_without_storing_password(
         def __init__(self, name, *, connection):
             captured["queue"] = (name, connection)
 
-        def enqueue(self, function_path, document_version_id, **kwargs):
+        def enqueue(self, function_path, document_version_id, dispatch_version, **kwargs):
+            assert dispatch_version == 1
             captured["job"] = (function_path, document_version_id, kwargs)
 
     connection = FakeRedis()
@@ -1418,7 +1540,7 @@ def test_redis_ingestion_queue_reuses_document_worker_without_storing_password(
     )
     monkeypatch.setattr(rq, "Queue", FakeQueue)
 
-    RedisDocumentIngestionQueue(settings).enqueue("document-1")
+    RedisDocumentIngestionQueue(settings).enqueue("document-1", 1)
 
     assert captured["connection"] == (
         settings.redis_url,
@@ -1454,7 +1576,7 @@ def test_both_requirement_csv_imports_reject_files_over_the_shared_limit(
     monkeypatch.setenv("MAX_UPLOAD_SIZE_MB", "1")
     baseline = review_client.post(
         "/requirement-baselines",
-        json={"name": "Bounded CSV baseline", "system": "fleet_manager"},
+        json={"name": "Bounded CSV baseline", "system": "fleet_manager_wcs"},
     ).json()
     oversized = b"x" * (1024 * 1024 + 1)
 
@@ -1933,11 +2055,17 @@ def test_original_strategy_is_persisted_and_retrieves_the_unchanged_urs_once(
     finally:
         db.close()
 
-    assert queries == [(requirement_text, 6)]
+    assert queries == [(requirement_text, 10)]
     assert trace["strategy"] == "original"
     assert trace["retrieval"]["query_policy"] == "original_urs_byte_for_byte"
     assert trace["retrieval"]["queries"][0]["query"] == requirement_text
     assert trace["retrieval"]["queries"][0]["ranked_chunk_ids"] == ["chunk-original"]
+    assert trace["capture"]["execution_status"] == "completed"
+    # This third-party fake judge does not expose messages: don't call its
+    # otherwise successful business result a complete input capture.
+    assert trace["capture"]["capture_status"] == "incomplete"
+    assert trace["capture"]["attempt_id"]
+    assert any(event.get("stage") == "judge_messages_unavailable" for event in trace["capture"]["events"])
 
 
 def test_decomposed_strategy_keeps_at_most_three_unique_source_grounded_points():
@@ -1963,3 +2091,45 @@ def test_decomposed_strategy_keeps_at_most_three_unique_source_grounded_points()
     assert len(points) == 3
     assert [point.point_id for point in points] == ["p1", "p2", "p3"]
     assert all(point.source_excerpt in requirement_text for point in points)
+
+
+def test_new_http_run_freezes_evidence_policy_across_configuration_changes(review_client, monkeypatch):
+    monkeypatch.setenv("REVIEW_EVIDENCE_SELECTION_POLICY", "source_table_groups_v1")
+    baseline = review_client.post("/requirement-baselines", json={"name": "Policy freeze", "system": "fleet_manager_wcs"}).json()
+    review_client.post(f"/requirement-baselines/{baseline['id']}/requirements/import",
+        files={"file": ("urs.csv", b"requirement_code,requirement_text\nURS-001,Recover after failure\n", "text/csv")})
+    version_id = create_design_document(review_client)
+    review = review_client.post("/review-packages", json={"name": "Policy freeze review",
+        "system": "fleet_manager_wcs", "requirement_baseline_id": baseline["id"],
+        "design_document_version_ids": [version_id]}).json()
+    created = review_client.post(f"/review-packages/{review['id']}/analyses", json={"strategy": "original"})
+    assert created.status_code == 202
+    run_id = created.json()["id"]
+    # Changing the deployment default cannot alter an already submitted run.
+    monkeypatch.setenv("REVIEW_EVIDENCE_SELECTION_POLICY", "ranked_chunks_v1")
+    calls = []
+
+    class Retrieval:
+        def retrieve_candidates(self, query, filters, *, limit, pool_limit):
+            calls.append((limit, pool_limit))
+            return [EvidenceChunk(chunk_id="frozen-policy-chunk", document_version_id=version_id,
+                document_title="Manual", document_type="FS", version="1.0", page=38,
+                section="Recovery", content="The queue is recovered after restart.")]
+
+        def retrieve(self, *args, **kwargs):
+            raise AssertionError("Must retain the frozen group policy")
+
+    class Judge:
+        def judge(self, **kwargs):
+            return CandidateJudgment(design_status=CoverageStatus.PARTIALLY_COVERED,
+                evidence_chunk_ids=["frozen-policy-chunk"], rationale="Recovery is described.")
+
+    with database.get_session_factory()() as db:
+        run = db.get(AnalysisRun, run_id)
+        assert run.items[0].analysis_trace["evidence_selection_policy"] == "source_table_groups_v1"
+        CoverageAnalysisService(db, Retrieval(), Judge()).execute(run_id)
+        db.expire_all()
+        trace = db.get(AnalysisRun, run_id).items[0].analysis_trace
+        assert trace["evidence_selection_policy"] == "source_table_groups_v1"
+        assert trace["retrieval"]["selection"]["policy"] == "source_table_groups_v1"
+    assert calls == [(10, 30)]

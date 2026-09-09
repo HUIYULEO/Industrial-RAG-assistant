@@ -4,11 +4,15 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.api.auth import require_authenticated_user
 from app.api.dependencies import CurrentUser, DesignReviewChatDependency, scoped_review_service
-from app.api.schemas import ReviewChatCitation, ReviewChatRequest, ReviewChatResponse
+from app.api.schemas import DocumentChatRequest, ReviewChatCitation, ReviewChatRequest, ReviewChatResponse
 from app.core.logging_config import get_logger
+from app.domain.enums import DocumentStatus
+from app.domain.models import DocumentVersion
 from app.repositories.database import get_session_factory
 from app.services.design_review_chat_service import (
     GroundedAnswer,
@@ -48,10 +52,45 @@ def sse_event(event: str, payload: dict) -> str:
 def _load_review_scope(review_package_id: str, user: CurrentUser) -> tuple[str, list[str]]:
     db = get_session_factory()()
     try:
-        review = scoped_review_service(db, user).get_review_package(review_package_id)
+        service = scoped_review_service(db, user)
+        review = service.get_review_package(review_package_id)
+        service.ensure_review_ready(review)
         return review.system, [
             link.document_version_id for link in review.document_links
         ]
+    finally:
+        db.close()
+
+
+def _load_document_chat_scope(document_version_ids: list[str]) -> tuple[str, list[str], list[str]]:
+    """Validate a user-selected document scope without treating it as a review."""
+    db = get_session_factory()()
+    try:
+        if len(document_version_ids) != len(set(document_version_ids)):
+            raise ValueError("Document versions must be selected only once")
+        versions = list(
+            db.scalars(
+                select(DocumentVersion)
+                .options(selectinload(DocumentVersion.document))
+                .where(DocumentVersion.id.in_(document_version_ids))
+            )
+        )
+        if len(versions) != len(set(document_version_ids)):
+            raise LookupError("One or more document versions were not found")
+        if any(item.status == DocumentStatus.ARCHIVED.value for item in versions):
+            raise ValueError("Archived document versions cannot be queried")
+        if any(item.ingestion_status != "indexed" for item in versions):
+            raise ValueError("All selected document versions must be indexed before querying")
+        systems = {item.document.system for item in versions}
+        if len(systems) != 1:
+            raise ValueError("Selected document versions must belong to the same system")
+        if len(versions) == 2 and len({item.document_id for item in versions}) != 1:
+            raise ValueError("Version comparison requires two versions of the same document")
+        return (
+            next(iter(systems)),
+            [item.id for item in versions],
+            sorted({item.document.document_type for item in versions}),
+        )
     finally:
         db.close()
 
@@ -88,6 +127,33 @@ def design_review_chat(
     return chat_response(answer=answer, citations=citations, retrieval_query=retrieval_query)
 
 
+@router.post("/document-chat", response_model=ReviewChatResponse)
+def document_chat(
+    payload: DocumentChatRequest,
+    chat: DesignReviewChatDependency,
+):
+    """Answer against an explicitly chosen current, historical, or comparison scope."""
+    try:
+        system, document_version_ids, document_types = _load_document_chat_scope(
+            payload.document_version_ids
+        )
+        answer, citations, retrieval_query = chat.answer(
+            question=payload.question,
+            document_version_ids=document_version_ids,
+            system=system,
+            document_types=document_types,
+            conversation_history=[(message.role, message.content) for message in payload.conversation_history],
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Document chat failed for versions %s", payload.document_version_ids)
+        raise HTTPException(status_code=502, detail="The evidence answer could not be generated.") from exc
+    return chat_response(answer=answer, citations=citations, retrieval_query=retrieval_query)
+
+
 @router.post("/design-review/chat/stream")
 def stream_design_review_chat(
     payload: ReviewChatRequest,
@@ -101,6 +167,8 @@ def stream_design_review_chat(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     history = [(message.role, message.content) for message in payload.conversation_history]
 

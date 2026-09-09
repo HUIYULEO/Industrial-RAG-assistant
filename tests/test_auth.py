@@ -11,7 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.domain.models import User
+from app.domain.models import User, DocumentVersion
 from app.repositories import database
 from app.services.auth_service import AuthService
 
@@ -371,6 +371,10 @@ def test_engineer_cannot_modify_shared_knowledge_but_can_run_a_review(
         protected_client.get("/requirement-baselines", headers=engineer_headers).status_code
         == 200
     )
+    # Authorization scenario starts with an indexed shared source.
+    with database.get_session_factory()() as db:
+        db.get(DocumentVersion, document_id).ingestion_status = "indexed"
+        db.commit()
     review = protected_client.post(
         "/review-packages",
         json={

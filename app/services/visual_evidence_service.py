@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.domain.models import DocumentChunk, DocumentFigure, DocumentVersion
+from app.domain.models import DocumentChunk, DocumentFigure, DocumentVersion, ReviewPackageDocument
 
 
 _VISUAL_TERMS = re.compile(
@@ -69,7 +69,8 @@ class VisualEvidenceService:
         self.max_pages = max_pages
 
     def extract_pdf_candidates(
-        self, document_version_id: str, source_path: Path, *, pdf_password: str | None = None
+        self, document_version_id: str, source_path: Path, *, pdf_password: str | None = None,
+        expected_parse_version: int | None = None,
     ) -> list[DocumentFigure]:
         """Render likely diagram pages without calling an LLM or changing the retrieval index."""
         try:
@@ -77,9 +78,15 @@ class VisualEvidenceService:
         except ImportError as exc:  # pragma: no cover - dependency is pinned in production
             raise ValueError("PDF visual extraction requires the PyMuPDF dependency") from exc
 
-        version = self.db.get(DocumentVersion, document_version_id)
+        version = self._mutable_version(document_version_id)
         if version is None:
             raise LookupError("Document version not found")
+        if expected_parse_version is not None and (
+            version.parse_dispatch_version != expected_parse_version
+            or version.ingestion_status != "parsed_pending_index"
+        ):
+            self.db.rollback()
+            return []
         if source_path.suffix.lower() != ".pdf":
             return []
 
@@ -154,11 +161,12 @@ class VisualEvidenceService:
         return figure
 
     def analyse_figures(self, document_version_id: str, interpreter: VisualInterpreter) -> list[DocumentFigure]:
+        version = self._mutable_version(document_version_id)
+        if version.ingestion_status in {"parsing", "index_queued", "indexing"}:
+            raise ValueError("Visual analysis must wait until document processing is idle")
         figures = self.list_figures(document_version_id)
         if not figures:
             raise ValueError("No candidate visual pages were extracted from this PDF")
-        version = self.db.get(DocumentVersion, document_version_id)
-        assert version is not None
 
         for figure in figures:
             try:
@@ -186,6 +194,19 @@ class VisualEvidenceService:
         for figure in figures:
             self.db.refresh(figure)
         return figures
+
+    def _mutable_version(self, document_version_id: str) -> DocumentVersion:
+        version = self.db.scalar(
+            select(DocumentVersion).where(DocumentVersion.id == document_version_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
+        if version is None:
+            raise LookupError("Document version not found")
+        if self.db.scalar(select(ReviewPackageDocument.id).where(
+            ReviewPackageDocument.document_version_id == version.id
+        )) is not None:
+            raise ValueError("A document version in a frozen Review Package cannot change visual evidence")
+        return version
 
     def _upsert_citation_chunk(self, version: DocumentVersion, figure: DocumentFigure) -> None:
         labels = "; ".join(figure.visible_labels or []) or "No labels confidently identified"

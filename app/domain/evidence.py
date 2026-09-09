@@ -29,3 +29,7 @@ class EvidenceChunk:
     dense_score: float | None = None
     keyword_score: float | None = None
     fused_score: float | None = None
+    parent_provenance: dict | None = None
+    # Optional bounded model-facing representation; original content remains
+    # the immutable excerpt used when persisting source citations.
+    context_content: str | None = None

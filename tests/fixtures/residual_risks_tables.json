@@ -1,0 +1,20 @@
+{
+  "headers": [
+    "Danger",
+    "Actions taken by ABB Robotics",
+    "Risk reduction measures for the end-user/integrator"
+  ],
+  "pages": [
+    {"page": 61, "rows": [["Risk during transport", "Transport instructions are provided.", "Follow the transport instructions."]]},
+    {"page": 62, "rows": [["Risk during installation", "Installation instructions are provided.", "Follow the installation instructions."]]},
+    {"page": 63, "rows": [["Risk during operation", "Protective functions are provided.", "Keep the operating area controlled."]]},
+    {"page": 64, "rows": [["Risk during maintenance", "Maintenance instructions are provided.", "Use authorised maintenance personnel."]]},
+    {"page": 65, "rows": [["Risk from moving parts", "Moving parts are guarded.", "Do not enter the safeguarded area."]]},
+    {"page": 66, "rows": [["Risk from stored energy", "Stored-energy warnings are provided.", "Isolate energy before maintenance."]]},
+    {"page": 67, "rows": [["Risk during charging", "Charging controls are provided.", "Observe the charging instructions."]]},
+    {"page": 68, "rows": [["Risk of active battery contacts when the AMR is not charging.", "The charging contacts are disconnected from the battery when the AMR is removed from the charging station.", "It is forbidden to touch the battery contacts."], ["Risk of unexpected movement during online charging.", "The AMR is immobilised while charging.", "Keep the charging area clear."]]},
+    {"page": 69, "rows": [["Risk during manual charging", "Manual charging instructions are provided.", "Use the specified charging procedure."]]},
+    {"page": 70, "rows": [["Risk during cleaning", "Cleaning instructions are provided.", "Use approved cleaning methods."]]},
+    {"page": 71, "rows": [["Risk during disposal", "Disposal instructions are provided.", "Follow applicable disposal controls."]]}
+  ]
+}

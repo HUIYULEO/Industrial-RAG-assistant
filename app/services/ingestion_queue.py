@@ -15,16 +15,16 @@ class DocumentIngestionQueueUnavailable(RuntimeError):
 
 
 class DocumentIngestionQueue(Protocol):
-    def enqueue(self, document_version_id: str) -> None: ...
+    def enqueue(self, document_version_id: str, dispatch_version: int) -> None: ...
 
 
-def _execute_in_process(document_version_id: str) -> None:
+def _execute_in_process(document_version_id: str, dispatch_version: int) -> None:
     """Run a local background parse without surfacing post-response failures."""
     from app.core.logging_config import get_logger
     from app.workers.ingestion_worker import execute_document_ingestion
 
     try:
-        execute_document_ingestion(document_version_id)
+        execute_document_ingestion(document_version_id, dispatch_version)
     except Exception:
         get_logger(__name__).exception(
             "Background document parsing failed for document %s",
@@ -36,15 +36,15 @@ def _execute_in_process(document_version_id: str) -> None:
 class InProcessDocumentIngestionQueue:
     background_tasks: BackgroundTasks
 
-    def enqueue(self, document_version_id: str) -> None:
-        self.background_tasks.add_task(_execute_in_process, document_version_id)
+    def enqueue(self, document_version_id: str, dispatch_version: int) -> None:
+        self.background_tasks.add_task(_execute_in_process, document_version_id, dispatch_version)
 
 
 @dataclass
 class RedisDocumentIngestionQueue:
     settings: Settings
 
-    def enqueue(self, document_version_id: str) -> None:
+    def enqueue(self, document_version_id: str, dispatch_version: int) -> None:
         try:
             from redis import Redis
             from rq import Queue
@@ -61,6 +61,8 @@ class RedisDocumentIngestionQueue:
             ).enqueue(
                 "app.workers.ingestion_worker.execute_document_ingestion",
                 document_version_id,
+                dispatch_version,
+                job_id=f"document-parse-{document_version_id}-{dispatch_version}",
                 job_timeout=self.settings.document_index_job_timeout_seconds,
                 result_ttl=3600,
                 failure_ttl=7 * 24 * 3600,
