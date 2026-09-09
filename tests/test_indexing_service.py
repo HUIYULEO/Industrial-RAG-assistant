@@ -172,7 +172,7 @@ def test_worker_moves_queued_document_to_indexed(db: Session):
 
     assert indexed.ingestion_status == "indexed"
     assert indexed.ingestion_error is None
-    assert embeddings.calls == [["The WCS dispatches tasks."]]
+    assert embeddings.calls == [["[Section: Document]\n[Evidence: The WCS dispatches tasks.]"]]
     assert repository.records[0]["document_version_id"] == version.id
 
 

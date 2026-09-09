@@ -133,6 +133,8 @@ class ReviewService:
             select(DocumentVersion)
             .options(selectinload(DocumentVersion.document))
             .where(DocumentVersion.id == document_version_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if version is None:
             raise LookupError("Document version not found")
@@ -350,8 +352,13 @@ class ReviewService:
         requirement_baseline_id: str,
         design_document_version_ids: list[str],
     ) -> ReviewPackage:
-        if self.db.get(RequirementBaseline, requirement_baseline_id) is None:
+        if len(design_document_version_ids) != 1:
+            raise ValueError("A review package requires exactly one supplier document version")
+        baseline = self.db.get(RequirementBaseline, requirement_baseline_id)
+        if baseline is None:
             raise LookupError("Requirement baseline not found")
+        if baseline.system != system:
+            raise ValueError("Review system must match the requirement baseline system")
         requirements = self.list_requirements(requirement_baseline_id)
         if not requirements:
             raise ValueError("A review package requires at least one imported requirement")
@@ -363,6 +370,9 @@ class ReviewService:
                 select(DocumentVersion)
                 .options(selectinload(DocumentVersion.document))
                 .where(DocumentVersion.id.in_(design_document_version_ids))
+                .order_by(DocumentVersion.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         if len(versions) != len(set(design_document_version_ids)):
@@ -373,6 +383,10 @@ class ReviewService:
         archived = [item.id for item in versions if item.status == DocumentStatus.ARCHIVED.value]
         if archived:
             raise ValueError("Archived document versions cannot be added to a new Review Package")
+        if any(item.document.system != system for item in versions):
+            raise ValueError("All design document versions must match the review system")
+        if any(item.ingestion_status != "indexed" for item in versions):
+            raise ValueError("All design document versions must be indexed before the review is frozen")
 
         owner_user_id, organization_id = self._require_review_scope()
         review = ReviewPackage(
@@ -433,8 +447,13 @@ class ReviewService:
         ).order_by(ReviewPackage.created_at.desc())
         return list(self.db.scalars(statement))
 
-    def create_analysis_run(self, review_id: str, *, strategy: str = "decomposed") -> AnalysisRun:
+    def create_analysis_run(self, review_id: str, *, strategy: str = "decomposed",
+                            trace_branch_diagnostics: bool = False,
+                            evidence_selection_policy: str = "ranked_chunks_v1") -> AnalysisRun:
+        if evidence_selection_policy not in {"ranked_chunks_v1", "source_table_groups_v1"}:
+            raise ValueError("Unknown evidence selection policy")
         review = self.get_review_package(review_id)
+        self.ensure_review_ready(review)
         if not review.requirement_snapshots:
             raise ValueError("Review package has no frozen requirements")
         strategy_versions = {"original": "original-v1", "decomposed": "decomposed-v2"}
@@ -447,7 +466,9 @@ class ReviewService:
             strategy_version=strategy_versions[strategy],
         )
         run.items = [
-            AnalysisRunItem(requirement_snapshot_id=requirement.id, status="queued")
+            AnalysisRunItem(requirement_snapshot_id=requirement.id, status="queued",
+                            analysis_trace={"evidence_selection_policy": evidence_selection_policy,
+                                            "capture_options": {"branch_diagnostics": trace_branch_diagnostics}})
             for requirement in review.requirement_snapshots
         ]
         self.db.add(run)
@@ -463,6 +484,17 @@ class ReviewService:
         self.db.commit()
         self.db.refresh(run)
         return run
+
+    def ensure_review_ready(self, review: ReviewPackage) -> None:
+        """Reject legacy/incomplete scopes before treating an empty index as evidence."""
+        version_ids = [link.document_version_id for link in review.document_links]
+        versions = list(self.db.scalars(select(DocumentVersion).where(DocumentVersion.id.in_(version_ids))))
+        if len(version_ids) != 1 or not versions or len(versions) != len(set(version_ids)) or any(
+            item.ingestion_status != "indexed"
+            or item.document.system != review.system
+            for item in versions
+        ):
+            raise ValueError("Review evidence is not ready: one indexed version in the review system is required")
 
     def list_analysis_runs(self, review_id: str) -> list[AnalysisRun]:
         """Return durable audit runs for a Review Package, newest first."""

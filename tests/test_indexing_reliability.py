@@ -44,6 +44,43 @@ class UnavailableQueue(FakeQueue):
         raise DocumentIndexQueueUnavailable("Redis is unavailable")
 
 
+def test_permanent_publish_error_does_not_block_other_documents(db):
+    first, second = parsed_document(db), parsed_document(db)
+    for version in (first, second):
+        DocumentIndexSubmissionService(db).queue_document_version(version.id)
+
+    class SelectiveQueue(FakeQueue):
+        def enqueue(self, dispatch):
+            if dispatch.document_version_id == first.id:
+                raise ValueError("Invalid payload")
+            return super().enqueue(dispatch)
+
+    assert IndexingReliabilityService(db, settings()).dispatch_pending(SelectiveQueue()) == 1
+    assert first.ingestion_status == "index_failed"
+    assert second.index_job_id is not None
+
+
+def test_publish_failure_backs_off_and_eventually_stops(db):
+    from app.domain.analysis import ANALYSIS_OUTBOX_MAX_PUBLISH_ATTEMPTS
+
+    version = parsed_document(db)
+    DocumentIndexSubmissionService(db).queue_document_version(version.id)
+    service = IndexingReliabilityService(db, settings())
+    before = datetime.now(timezone.utc)
+    with pytest.raises(DocumentIndexQueueUnavailable):
+        service.dispatch_pending(UnavailableQueue())
+    outbox = db.scalar(select(DocumentIndexDispatchOutbox))
+    assert outbox.publish_attempts == 1
+    assert outbox.available_at.replace(tzinfo=timezone.utc) > before
+    assert service.dispatch_pending(UnavailableQueue()) == 0
+    outbox.publish_attempts = ANALYSIS_OUTBOX_MAX_PUBLISH_ATTEMPTS - 1
+    outbox.available_at = before - timedelta(seconds=1)
+    db.commit()
+    assert service.dispatch_pending(UnavailableQueue()) == 0
+    assert outbox.status == "blocked"
+    assert version.ingestion_status == "index_failed"
+
+
 def settings() -> Settings:
     return Settings(
         _env_file=None,

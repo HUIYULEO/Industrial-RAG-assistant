@@ -16,6 +16,7 @@ from app.services.analysis_queue import (
 from app.services.analysis_reliability_service import AnalysisReliabilityService
 from app.services.indexing_queue import DocumentIndexQueueUnavailable, get_document_index_queue
 from app.services.indexing_reliability_service import IndexingReliabilityService
+from app.bootstrap.service_factory import build_document_ingestion_service
 
 setup_logging()
 logger = get_logger(__name__)
@@ -33,6 +34,17 @@ def run() -> None:
     signal.signal(signal.SIGINT, stop)
     logger.info("Analysis maintenance loop started")
     while not stopped.is_set():
+        parse_db = get_session_factory()()
+        try:
+            recovered = build_document_ingestion_service(parse_db).recover_expired_parses(
+                settings.document_parse_stale_after_seconds
+            )
+            if recovered:
+                logger.warning("Marked %s expired parse jobs as retryable failures", recovered)
+        except Exception:
+            logger.exception("Parse recovery cycle failed")
+        finally:
+            parse_db.close()
         db = get_session_factory()()
         try:
             result = AnalysisReliabilityService(db, settings).tick(get_analysis_queue())

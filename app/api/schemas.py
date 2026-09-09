@@ -237,6 +237,14 @@ class ReviewChatRequest(BaseModel):
     conversation_history: list[ReviewChatHistoryMessage] = Field(default_factory=list, max_length=12)
 
 
+class DocumentChatRequest(BaseModel):
+    """Explicit document-version scope for non-review Q&A and comparison."""
+
+    question: str = Field(min_length=1, max_length=4000)
+    document_version_ids: list[str] = Field(min_length=1, max_length=2)
+    conversation_history: list[ReviewChatHistoryMessage] = Field(default_factory=list, max_length=12)
+
+
 class ReviewChatCitation(BaseModel):
     chunk_id: str
     document_version_id: str

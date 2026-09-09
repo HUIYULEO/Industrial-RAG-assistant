@@ -206,12 +206,14 @@ class DesignReviewChatService:
         question: str,
         document_version_ids: list[str],
         system: str,
+        document_types: list[str] | None = None,
         conversation_history: list[tuple[str, str]] | None = None,
     ) -> tuple[GroundedAnswer, list[EvidenceChunk], str]:
         prepared = self.prepare(
             question=question,
             document_version_ids=document_version_ids,
             system=system,
+            document_types=document_types,
             conversation_history=conversation_history,
         )
         if prepared.no_evidence_answer:
@@ -229,6 +231,7 @@ class DesignReviewChatService:
         question: str,
         document_version_ids: list[str],
         system: str,
+        document_types: list[str] | None = None,
         conversation_history: list[tuple[str, str]] | None = None,
     ) -> PreparedAnswer:
         """Normalize and retrieve once before either delivery mode begins."""
@@ -239,7 +242,7 @@ class DesignReviewChatService:
             RetrievalFilters(
                 document_version_ids=document_version_ids,
                 system=system,
-                document_types=sorted(DESIGN_DOCUMENT_TYPES),
+                document_types=document_types or sorted(DESIGN_DOCUMENT_TYPES),
             ),
             limit=6,
         )

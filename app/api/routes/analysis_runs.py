@@ -168,7 +168,10 @@ def create_analysis_run(
 ):
     service = scoped_review_service(db, user)
     try:
-        item = service.create_analysis_run(review_id, strategy=(payload or AnalysisRunCreate()).strategy)
+        item = service.create_analysis_run(
+            review_id, strategy=(payload or AnalysisRunCreate()).strategy,
+            evidence_selection_policy=get_settings().review_evidence_selection_policy,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

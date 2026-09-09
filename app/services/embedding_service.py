@@ -19,6 +19,9 @@ class ConfiguredEmbeddingService:
 
     def __init__(self, settings: Settings):
         self._client = create_embedding_model(settings)
+        self.model_info = {"provider": settings.embedding_provider,
+                           "model": settings.embedding_model,
+                           "dimensions": settings.embedding_dimensions}
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._client.embed_documents(texts)

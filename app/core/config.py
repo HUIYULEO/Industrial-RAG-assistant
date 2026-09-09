@@ -6,6 +6,7 @@ locally without an LLM, a vector store, or supplier documents.
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -70,6 +71,9 @@ class Settings(BaseSettings):
     analysis_queue_name: str = "design-review"
     document_index_queue_name: str = "document-indexing"
     document_index_job_timeout_seconds: int = 1800
+    # Low-volume predeployment: stuck parses become visible failures for manual
+    # retry. This deadline also bounds jobs lost between DB commit and enqueue.
+    document_parse_stale_after_seconds: int = 3600
     document_index_queued_timeout_seconds: int = 900
     document_index_stale_after_seconds: int = 2100
     document_index_max_attempts: int = 3
@@ -82,6 +86,9 @@ class Settings(BaseSettings):
     analysis_heartbeat_interval_seconds: int = 30
     analysis_maintenance_poll_seconds: float = 2.0
     worker_build_version: str = "local"
+    # New HTTP review runs freeze this policy in their item trace. Existing
+    # runs and explicit baseline-replay scripts retain ranked_chunks_v1.
+    review_evidence_selection_policy: Literal["ranked_chunks_v1", "source_table_groups_v1"] = "source_table_groups_v1"
 
     model_config = SettingsConfigDict(
         env_file=".env",

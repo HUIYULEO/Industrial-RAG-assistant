@@ -8,6 +8,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.domain.analysis import ANALYSIS_OUTBOX_MAX_PUBLISH_ATTEMPTS, ANALYSIS_OUTBOX_RETRY_DELAYS_SECONDS
 from app.domain.models import DocumentIndexDispatchOutbox, DocumentVersion
 from app.services.indexing_queue import (
     DocumentIndexDispatch,
@@ -59,41 +60,58 @@ class IndexingReliabilityService:
         return created
 
     def dispatch_pending(self, queue: DocumentIndexQueue, *, limit: int = 100) -> int:
-        rows = list(
-            self.db.scalars(
-                select(DocumentIndexDispatchOutbox)
-                .where(
-                    DocumentIndexDispatchOutbox.status == "pending",
-                    DocumentIndexDispatchOutbox.available_at <= self._now(),
-                )
-                .order_by(DocumentIndexDispatchOutbox.created_at, DocumentIndexDispatchOutbox.id)
-                .limit(limit)
-            )
-        )
+        now = self._now()
+        rows = list(self.db.scalars(
+            select(DocumentIndexDispatchOutbox)
+            .where(DocumentIndexDispatchOutbox.status == "pending",
+                   DocumentIndexDispatchOutbox.available_at <= now)
+            .order_by(DocumentIndexDispatchOutbox.created_at, DocumentIndexDispatchOutbox.id)
+            .limit(limit).with_for_update(skip_locked=True)
+        ))
         dispatched = 0
-        for outbox in rows:
-            version = self.db.get(DocumentVersion, outbox.document_version_id)
-            if (
-                version is None
-                or version.ingestion_status != "index_queued"
-                or version.index_dispatch_version != outbox.dispatch_version
-            ):
+        deferred_error = None
+        for index, outbox in enumerate(rows):
+            version = self.db.scalar(
+                select(DocumentVersion).where(DocumentVersion.id == outbox.document_version_id)
+                .with_for_update().execution_options(populate_existing=True)
+            )
+            if (version is None or version.ingestion_status != "index_queued"
+                    or version.index_dispatch_version != outbox.dispatch_version):
                 outbox.status = "obsolete"
-                self.db.commit()
                 continue
             dispatch = DocumentIndexDispatch(
-                document_version_id=version.id,
-                dispatch_version=outbox.dispatch_version,
+                document_version_id=version.id, dispatch_version=outbox.dispatch_version,
                 job_id=document_index_job_id(version.id, outbox.dispatch_version),
             )
             try:
                 job_id = queue.enqueue(dispatch)
+                if job_id != dispatch.job_id:
+                    raise ValueError("Index queue returned an unexpected job ID")
             except Exception as exc:
                 outbox.publish_attempts += 1
                 outbox.error_message = str(exc)
-                self.db.commit()
-                raise
-            now = self._now()
+                # Classify the adapter's original error, without treating every
+                # wrapped Redis error as a permanent payload defect.
+                cause = exc.__cause__ or exc
+                permanent = isinstance(cause, (ValueError, TypeError, ImportError, AttributeError))
+                exhausted = outbox.publish_attempts >= ANALYSIS_OUTBOX_MAX_PUBLISH_ATTEMPTS
+                if permanent or exhausted:
+                    outbox.status = "blocked"
+                    version.ingestion_status = "index_failed"
+                    version.ingestion_error = f"Index dispatch blocked: {exc}"
+                    version.index_job_id = None
+                    version.index_started_at = None
+                    # A bad document must not prevent later documents dispatching.
+                    continue
+                delay = ANALYSIS_OUTBOX_RETRY_DELAYS_SECONDS[
+                    min(outbox.publish_attempts - 1, len(ANALYSIS_OUTBOX_RETRY_DELAYS_SECONDS) - 1)
+                ]
+                retry_at = now + timedelta(seconds=delay)
+                outbox.available_at = retry_at
+                for remaining in rows[index + 1:]:
+                    remaining.available_at = retry_at
+                deferred_error = exc
+                break
             outbox.status = "dispatched"
             outbox.job_id = job_id
             outbox.publish_attempts += 1
@@ -101,8 +119,10 @@ class IndexingReliabilityService:
             outbox.dispatched_at = now
             version.index_job_id = job_id
             version.ingestion_error = None
-            self.db.commit()
             dispatched += 1
+        self.db.commit()
+        if deferred_error is not None:
+            raise deferred_error
         return dispatched
 
     def recover_stale_queued_jobs(self, queue: DocumentIndexQueue) -> int:

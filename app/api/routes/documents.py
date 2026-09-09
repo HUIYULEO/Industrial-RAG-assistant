@@ -114,13 +114,13 @@ async def upload_document(
             content,
             pdf_password=pdf_password,
         )
-        ingestion_queue.enqueue(document_version_id)
+        ingestion_queue.enqueue(document_version_id, item.parse_dispatch_version)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except DocumentIngestionQueueUnavailable as exc:
-        ingestion.mark_staged_parse_failed(document_version_id, str(exc))
+        ingestion.mark_staged_parse_failed(document_version_id, str(exc), item.parse_dispatch_version)
         logger.exception(
             "Document parsing submission failed for document %s",
             document_version_id,
@@ -148,14 +148,14 @@ def reparse_document(
         item = ingestion.stage_reparse(
             document_version_id, pdf_password=pdf_password
         )
-        ingestion_queue.enqueue(document_version_id)
+        ingestion_queue.enqueue(document_version_id, item.parse_dispatch_version)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         status_code = 409 if "already being parsed" in str(exc) else 400
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except DocumentIngestionQueueUnavailable as exc:
-        ingestion.mark_staged_parse_failed(document_version_id, str(exc))
+        ingestion.mark_staged_parse_failed(document_version_id, str(exc), item.parse_dispatch_version)
         logger.exception(
             "Document reparsing submission failed for document %s",
             document_version_id,

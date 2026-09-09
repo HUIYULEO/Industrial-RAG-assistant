@@ -79,6 +79,9 @@ class DocumentVersion(Base):
     storage_path: Mapped[str | None] = mapped_column(String(1000))
     ingestion_status: Mapped[str] = mapped_column(String(40), nullable=False, default="registered")
     ingestion_error: Mapped[str | None] = mapped_column(Text)
+    parse_dispatch_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    parse_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    parse_owner: Mapped[str | None] = mapped_column(String(36))
     index_dispatch_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )

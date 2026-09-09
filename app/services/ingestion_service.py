@@ -8,6 +8,8 @@ import csv
 from collections import Counter
 from io import BytesIO, StringIO
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 from pathlib import Path
 from typing import NoReturn
 
@@ -15,7 +17,7 @@ import fitz
 from docx import Document as WordDocument
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, or_
 from sqlalchemy.orm import Session
 
 from app.core.logging_config import get_logger
@@ -43,6 +45,43 @@ DEFAULT_CHUNK_SIZE = 2_200
 # Preserve 200 characters of neighbouring context across long chunks to improve
 # retrieval recall while keeping each persisted passage independently citable.
 DEFAULT_CHUNK_OVERLAP = 200
+
+
+def section_path_for(section: str | None) -> str:
+    """Return the smallest stable section path available from extraction."""
+    return " ".join((section or "Document").split()) or "Document"
+
+
+def parent_section_id_for(section_path: str) -> str:
+    """Derive a deterministic, compact parent identifier from its path."""
+    digest = hashlib.sha1(section_path.casefold().encode("utf-8")).hexdigest()[:16]
+    return f"section:{digest}"
+
+
+def table_id_for(section_path: str, table_index: object, headers: list[str]) -> str:
+    """Derive a stable table identifier without adding a table entity."""
+    identity = "|".join(
+        [section_path, str(table_index), *[" ".join(value.split()) for value in headers]]
+    )
+    return f"table:{hashlib.sha1(identity.casefold().encode('utf-8')).hexdigest()[:16]}"
+
+
+def build_embedding_text(
+    content: str,
+    *,
+    section_path: str,
+    element_type: str,
+    source_metadata: dict | None = None,
+) -> str:
+    """Add bounded retrieval context while leaving the citable content intact."""
+    metadata = source_metadata or {}
+    lines = [f"[Section: {section_path}]"]
+    if element_type == "table_row":
+        headers = [str(value).strip() for value in metadata.get("headers", []) if str(value).strip()]
+        if headers:
+            lines.append(f"[Table header: {' | '.join(headers)}]")
+    lines.append(f"[Evidence: {content}]")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -90,6 +129,15 @@ class DocumentIngestionService:
 
     supported_extensions = {".pdf", ".docx", ".csv"}
 
+    def _lock_version(self, document_version_id: str) -> DocumentVersion:
+        version = self.db.scalar(
+            select(DocumentVersion).where(DocumentVersion.id == document_version_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
+        if version is None:
+            raise LookupError("Document version not found")
+        return version
+
     def _ensure_version_can_be_modified(self, version: DocumentVersion) -> None:
         if self.db.scalar(
             select(ReviewPackageDocument.id).where(
@@ -107,16 +155,28 @@ class DocumentIngestionService:
             )
 
     def _raise_ingestion_failure(
-        self, document_version_id: str, suffix: str, original_error: Exception
+        self, document_version_id: str, suffix: str, original_error: Exception,
+        *, expected_parse_version: int | None = None, owner: str | None = None,
     ) -> NoReturn:
         """Rollback failed writes and retain the original ingestion diagnostic."""
         self.db.rollback()
         try:
-            version = self.db.get(DocumentVersion, document_version_id)
-            if version is not None:
+            version = self._lock_version(document_version_id)
+            if (
+                (expected_parse_version is None or version.parse_dispatch_version == expected_parse_version)
+                and (owner is None or version.parse_owner == owner)
+                and not (owner is None and version.ingestion_status in {"parsing", "index_queued", "indexing"})
+                and self.db.scalar(select(ReviewPackageDocument.id).where(
+                    ReviewPackageDocument.document_version_id == version.id
+                )) is None
+            ):
                 version.ingestion_status = "failed"
                 version.ingestion_error = str(original_error)
+                version.parse_owner = None
+                version.parse_started_at = None
                 self.db.commit()
+            else:
+                self.db.rollback()
         except Exception:
             # A second persistence failure must not replace the parsing/write
             # exception that explains why ingestion failed.
@@ -126,14 +186,14 @@ class DocumentIngestionService:
         ) from original_error
 
     @staticmethod
-    def _staged_pdf_path(source_path: Path) -> Path:
-        return source_path.with_name(f".{source_path.name}.parsing.pdf")
+    def _staged_pdf_path(source_path: Path, dispatch_version: int = 0) -> Path:
+        return source_path.with_name(f".{source_path.name}.parsing-{dispatch_version}.pdf")
 
     def _prepare_pdf_for_background(
-        self, source_path: Path, pdf_password: str | None
+        self, source_path: Path, pdf_password: str | None, dispatch_version: int = 0
     ) -> None:
         """Validate encrypted PDFs without persisting their one-time password."""
-        staged_path = self._staged_pdf_path(source_path)
+        staged_path = self._staged_pdf_path(source_path, dispatch_version)
         staged_path.unlink(missing_ok=True)
         with fitz.open(str(source_path)) as document:
             if not document.needs_pass:
@@ -171,9 +231,7 @@ class DocumentIngestionService:
         pdf_password: str | None = None,
     ) -> DocumentVersion:
         """Persist a source and commit the parsing state before job submission."""
-        version = self.db.get(DocumentVersion, document_version_id)
-        if version is None:
-            raise LookupError("Document version not found")
+        version = self._lock_version(document_version_id)
         self._ensure_version_can_be_modified(version)
         suffix = Path(filename).suffix.lower()
         if suffix not in self.supported_extensions:
@@ -182,23 +240,28 @@ class DocumentIngestionService:
             raise ValueError("Uploaded file is empty")
 
         safe_name = Path(filename).name
-        target_dir = self.data_dir / "raw" / version.id
+        # A failed replacement must never overwrite the previous source bytes.
+        target_dir = self.data_dir / "raw" / version.id / str(uuid4())
         target_path = target_dir / safe_name
 
+        next_parse_version = version.parse_dispatch_version + 1
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
             target_path.write_bytes(content)
             version.file_name = safe_name
             version.file_hash = hashlib.sha256(content).hexdigest()
             version.storage_path = str(target_path)
+            version.parse_dispatch_version = next_parse_version
+            version.parse_started_at = datetime.now(timezone.utc)
+            version.parse_owner = None
             version.ingestion_status = "parsing"
             version.ingestion_error = None
             if suffix == ".pdf":
-                self._prepare_pdf_for_background(target_path, pdf_password)
+                self._prepare_pdf_for_background(target_path, pdf_password, next_parse_version)
             self.db.commit()
         except Exception as exc:
-            self._staged_pdf_path(target_path).unlink(missing_ok=True)
-            self._raise_ingestion_failure(version.id, suffix, exc)
+            self._staged_pdf_path(target_path, next_parse_version).unlink(missing_ok=True)
+            self._raise_ingestion_failure(version.id, suffix, exc, expected_parse_version=next_parse_version - 1)
         self.db.refresh(version)
         return version
 
@@ -206,46 +269,106 @@ class DocumentIngestionService:
         self, document_version_id: str, *, pdf_password: str | None = None
     ) -> DocumentVersion:
         """Validate a stored source and commit a new parsing state."""
-        version = self.db.get(DocumentVersion, document_version_id)
-        if version is None:
-            raise LookupError("Document version not found")
+        version = self._lock_version(document_version_id)
         self._ensure_version_can_be_modified(version)
         source_path = self._stored_source_path(version)
+        next_parse_version = version.parse_dispatch_version + 1
         try:
             if source_path.suffix.lower() == ".pdf":
-                self._prepare_pdf_for_background(source_path, pdf_password)
+                self._prepare_pdf_for_background(source_path, pdf_password, next_parse_version)
+            version.parse_dispatch_version = next_parse_version
+            version.parse_started_at = datetime.now(timezone.utc)
+            version.parse_owner = None
             version.ingestion_status = "parsing"
             version.ingestion_error = None
             self.db.commit()
         except Exception as exc:
-            self._staged_pdf_path(source_path).unlink(missing_ok=True)
-            self._raise_ingestion_failure(version.id, source_path.suffix.lower(), exc)
+            self._staged_pdf_path(source_path, next_parse_version).unlink(missing_ok=True)
+            self._raise_ingestion_failure(version.id, source_path.suffix.lower(), exc, expected_parse_version=next_parse_version - 1)
         self.db.refresh(version)
         return version
 
-    def parse_staged_document(self, document_version_id: str) -> DocumentVersion:
+    def parse_staged_document(
+        self, document_version_id: str, expected_dispatch_version: int | None = None
+    ) -> DocumentVersion:
         """Run parsing in a worker after the request Session has been released."""
-        version = self.db.get(DocumentVersion, document_version_id)
-        if version is None:
-            raise LookupError("Document version not found")
-        source_path = self._stored_source_path(version)
+        version = self._lock_version(document_version_id)
+        if expected_dispatch_version is None:
+            expected_dispatch_version = version.parse_dispatch_version
+        if (
+            version.ingestion_status != "parsing"
+            or version.parse_dispatch_version != expected_dispatch_version
+            or version.parse_owner is not None
+            or self.db.scalar(select(ReviewPackageDocument.id).where(
+                ReviewPackageDocument.document_version_id == version.id
+            )) is not None
+        ):
+            self.db.rollback()
+            return version
+        owner = str(uuid4())
+        version.parse_owner = owner
+        version.parse_started_at = datetime.now(timezone.utc)
+        self.db.commit()
+        source_path = Path(version.storage_path or "")
         suffix = source_path.suffix.lower()
-        staged_pdf_path = self._staged_pdf_path(source_path)
-        parse_path = staged_pdf_path if suffix == ".pdf" and staged_pdf_path.is_file() else source_path
+        staged_pdf_path = None
 
         try:
             try:
+                source_path = self._stored_source_path(version)
+                staged_pdf_path = self._staged_pdf_path(source_path, expected_dispatch_version)
+                parse_path = staged_pdf_path if suffix == ".pdf" and staged_pdf_path.is_file() else source_path
                 parsed_chunks, source_units = self._parse_source(parse_path, suffix)
             except Exception as exc:
-                self._raise_ingestion_failure(version.id, suffix, exc)
+                self._raise_ingestion_failure(
+                    version.id, suffix, exc, expected_parse_version=expected_dispatch_version, owner=owner
+                )
 
             try:
+                version = self._lock_version(document_version_id)
+                if (
+                    version.ingestion_status != "parsing"
+                    or version.parse_dispatch_version != expected_dispatch_version
+                    or version.parse_owner != owner
+                ):
+                    self.db.rollback()
+                    return version
                 self.db.execute(
                     delete(DocumentChunk).where(
                         DocumentChunk.document_version_id == version.id
                     )
                 )
                 for index, chunk in enumerate(parsed_chunks):
+                    source_metadata = dict(chunk.source_metadata or {})
+                    section_path = section_path_for(
+                        source_metadata.get("section_path") or chunk.section
+                    )
+                    source_metadata.update(
+                        {
+                            "document_version_id": version.id,
+                            "page": chunk.page,
+                            "section_path": section_path,
+                            "parent_section_id": source_metadata.get(
+                                "parent_section_id", parent_section_id_for(section_path)
+                            ),
+                            "element_type": chunk.element_type,
+                            "chunk_sequence": index,
+                        }
+                    )
+                    if chunk.element_type == "table_row":
+                        source_metadata["table_id"] = source_metadata.get(
+                            "table_id",
+                            table_id_for(
+                                section_path,
+                                source_metadata.get("table_index", "unknown"),
+                                [
+                                    str(value)
+                                    for value in source_metadata.get("headers", [])
+                                ],
+                            ),
+                        )
+                    else:
+                        source_metadata.pop("table_id", None)
                     self.db.add(
                         DocumentChunk(
                             document_version_id=version.id,
@@ -253,7 +376,7 @@ class DocumentIngestionService:
                             page=chunk.page,
                             section=chunk.section,
                             element_type=chunk.element_type,
-                            source_metadata=chunk.source_metadata,
+                            source_metadata=source_metadata,
                             content=chunk.content,
                             content_hash=hashlib.sha256(
                                 chunk.content.encode("utf-8")
@@ -263,14 +386,18 @@ class DocumentIngestionService:
                 version.page_count = source_units
                 version.chunk_count = len(parsed_chunks)
                 version.ingestion_status = "parsed_pending_index"
+                version.parse_owner = None
+                version.parse_started_at = None
                 self.db.commit()
             except Exception as exc:
-                self._raise_ingestion_failure(version.id, suffix, exc)
+                self._raise_ingestion_failure(
+                    version.id, suffix, exc, expected_parse_version=expected_dispatch_version, owner=owner
+                )
 
             if suffix == ".pdf":
                 try:
                     VisualEvidenceService(self.db, self.data_dir).extract_pdf_candidates(
-                        version.id, parse_path
+                        version.id, parse_path, expected_parse_version=expected_dispatch_version
                     )
                 except Exception:
                     self.db.rollback()
@@ -283,21 +410,60 @@ class DocumentIngestionService:
             self.db.refresh(version)
             return version
         finally:
-            staged_pdf_path.unlink(missing_ok=True)
+            if staged_pdf_path is not None:
+                staged_pdf_path.unlink(missing_ok=True)
 
     def mark_staged_parse_failed(
-        self, document_version_id: str, error_message: str
+        self, document_version_id: str, error_message: str, expected_dispatch_version: int | None = None
     ) -> None:
         """Make a failed queue submission visible instead of leaving parsing stuck."""
         self.db.rollback()
-        version = self.db.get(DocumentVersion, document_version_id)
-        if version is None or version.ingestion_status != "parsing":
+        version = self._lock_version(document_version_id)
+        if version.ingestion_status != "parsing" or (
+            expected_dispatch_version is not None
+            and version.parse_dispatch_version != expected_dispatch_version
+        ) or version.parse_owner is not None:
+            self.db.rollback()
             return
         if version.storage_path:
-            self._staged_pdf_path(Path(version.storage_path)).unlink(missing_ok=True)
+            self._staged_pdf_path(Path(version.storage_path), version.parse_dispatch_version).unlink(missing_ok=True)
         version.ingestion_status = "failed"
         version.ingestion_error = error_message
+        version.parse_started_at = None
+        version.parse_owner = None
         self.db.commit()
+
+    def recover_expired_parses(self, stale_after_seconds: int) -> int:
+        """Make lost/terminated parses explicitly retryable; no implicit LLM work.
+
+        A bounded SQL sweep is the deliberate low-volume deployment policy.
+        Incrementing the generation fences both queued and currently executing
+        old workers. The user can reparse the preserved source after recovery.
+        """
+        if stale_after_seconds < 1:
+            raise ValueError("Parse timeout must be positive")
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+        versions = list(self.db.scalars(
+            select(DocumentVersion).where(
+                DocumentVersion.ingestion_status == "parsing",
+                or_(DocumentVersion.parse_started_at.is_(None), DocumentVersion.parse_started_at < cutoff),
+            ).order_by(DocumentVersion.id).limit(100).with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        ))
+        for version in versions:
+            old_generation = version.parse_dispatch_version
+            version.parse_dispatch_version += 1
+            version.parse_owner = None
+            version.parse_started_at = None
+            version.ingestion_status = "failed"
+            version.ingestion_error = "Parsing timed out or its job was lost. Reparse the preserved source to retry."
+            if version.storage_path:
+                try:
+                    self._staged_pdf_path(Path(version.storage_path), old_generation).unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Unable to remove expired parse staging file", exc_info=True)
+        self.db.commit()
+        return len(versions)
 
     def upload_and_parse(
         self,
@@ -437,8 +603,8 @@ class DocumentIngestionService:
                 key=lambda chunk: (
                     chunk.page,
                     1 if chunk.element_type == "table_row" else 0,
-                    str((chunk.source_metadata or {}).get("table_index", "")),
-                    str((chunk.source_metadata or {}).get("row_index", "")),
+                    int((chunk.source_metadata or {}).get("table_index", 0)),
+                    int((chunk.source_metadata or {}).get("row_index", 0)),
                 )
             )
 
@@ -472,7 +638,9 @@ class DocumentIngestionService:
     def _extract_pdf_tables(self, page: fitz.Page, page_number: int) -> list[PdfTable]:
         """Extract raw table grids while retaining page-local bounding boxes."""
         result: list[PdfTable] = []
-        finder = page.find_tables()
+        # Ignore borderless background rectangles: they can turn most of a
+        # manual page (prose + figure + real table) into one spurious grid.
+        finder = page.find_tables(strategy="lines_strict")
         for table_index, table in enumerate(finder.tables, start=1):
             raw_rows = table.extract() or []
             rows = [
@@ -491,11 +659,13 @@ class DocumentIngestionService:
             if self._looks_like_table_header(first_row):
                 headers = first_row
                 rows = rows[1:]
-            elif any(header_names):
+            elif self._plausible_table_header(header_names):
                 headers = header_names
+                if self._same_table_row(first_row, headers):
+                    rows = rows[1:]
             else:
                 headers = [f"Column {index}" for index in range(1, len(first_row) + 1)]
-            width = max(len(headers), *(len(row) for row in rows))
+            width = max([len(headers), *(len(row) for row in rows)])
             headers = (headers + [f"Column {index}" for index in range(len(headers) + 1, width + 1)])[:width]
             rows = [(row + [""] * width)[:width] for row in rows]
             result.append(
@@ -514,19 +684,21 @@ class DocumentIngestionService:
     ) -> set[str]:
         """Identify running headers/footers repeated on multiple PDF pages."""
         counts: Counter[str] = Counter()
+        margin_candidates: set[str] = set()
         for blocks, _, page_height in pages:
-            seen_on_page: set[str] = set()
             for block in blocks:
-                if block.bbox[3] > page_height * 0.16 and block.bbox[1] < page_height * 0.84:
-                    continue
-                seen_on_page.update(
+                keys = [
                     self._artifact_key(line)
                     for line in block.text.splitlines()
                     if self._artifact_key(line)
-                )
-            counts.update(seen_on_page)
-        threshold = max(2, int(len(pages) * 0.3 + 0.999))
-        return {line for line, count in counts.items() if count >= threshold}
+                ]
+                counts.update(keys)
+                if block.bbox[3] <= page_height * 0.08 or block.bbox[1] >= page_height * 0.88:
+                    margin_candidates.update(keys)
+        # A running section heading may also occur as a real heading later on
+        # the same page. Remove only its margin copy, keeping the body heading.
+        # A global 30%-of-document threshold misses short chapters entirely.
+        return {line for line in margin_candidates if counts[line] >= 2}
 
     def _clean_pdf_block(
         self,
@@ -535,7 +707,7 @@ class DocumentIngestionService:
         page_height: float,
         repeated_margin_lines: set[str],
     ) -> str:
-        is_margin = block.bbox[3] <= page_height * 0.16 or block.bbox[1] >= page_height * 0.84
+        is_margin = block.bbox[3] <= page_height * 0.08 or block.bbox[1] >= page_height * 0.88
         lines: list[str] = []
         for line in block.text.splitlines():
             stripped = line.strip()
@@ -568,7 +740,17 @@ class DocumentIngestionService:
                 for row_index, cells in enumerate(table.rows, start=1):
                     if self._same_table_row(cells, headers) or not any(cells):
                         continue
-                    if not cells[0] and logical_rows and logical_rows[-1]["headers"] == headers:
+                    if (
+                        not cells[0] and logical_rows
+                        and row_index == 1
+                        and logical_rows[-1]["headers"] == headers
+                        and len(logical_rows[-1]["cells"]) == len(cells)
+                        and table.page == logical_rows[-1]["page_end"] + 1
+                        and table.table_index == 1
+                        and section_by_page.get(table.page) == section_by_page.get(logical_rows[-1]["page"])
+                        and abs(table.bbox[0] - logical_rows[-1]["bbox"][0]) <= 5
+                        and abs(table.bbox[2] - logical_rows[-1]["bbox"][2]) <= 5
+                    ):
                         previous = logical_rows[-1]
                         previous["cells"] = [
                             self._join_cell_text(old, new)
@@ -637,7 +819,14 @@ class DocumentIngestionService:
             text = self._normalise_text("\n".join(paragraph_buffer))
             if text:
                 reference = f"{current_heading or 'Document body'} | paragraphs {buffer_start}-{last_index}"
-                chunks.extend(self._split_buffer(text, buffer_start, reference))
+                chunks.extend(
+                    self._split_buffer(
+                        text,
+                        buffer_start,
+                        reference,
+                        source_metadata={"section_path": current_heading or "Document"},
+                    )
+                )
             paragraph_buffer = []
 
         for child in document.element.body.iterchildren():
@@ -669,7 +858,21 @@ class DocumentIngestionService:
                     values = [f"{headers[i] or f'Column {i + 1}'}: {value}" for i, value in enumerate(row) if value]
                     if values:
                         reference = f"{current_heading or 'Document body'} | table {structural_index}, row {row_number}"
-                        chunks.extend(self._split_buffer(" | ".join(values), structural_index, reference))
+                        chunks.extend(
+                            self._split_buffer(
+                                " | ".join(values),
+                                structural_index,
+                                reference,
+                                element_type="table_row",
+                                source_metadata={
+                                    "section_path": current_heading or "Document",
+                                    "table_index": structural_index,
+                                    "row_index": row_number,
+                                    "headers": headers,
+                                    "cells": row,
+                                },
+                            )
+                        )
         flush_paragraphs(structural_index)
         if not chunks:
             raise ValueError("No readable paragraphs or table rows found in DOCX")
@@ -686,7 +889,20 @@ class DocumentIngestionService:
         for row_count, row in enumerate(reader, start=1):
             values = [f"{header}: {self._normalise_text(value or '')}" for header, value in row.items() if self._normalise_text(value or "")]
             if values:
-                chunks.extend(self._split_buffer(" | ".join(values), row_count, f"CSV row {row_count}"))
+                chunks.extend(
+                    self._split_buffer(
+                        " | ".join(values),
+                        row_count,
+                        f"CSV row {row_count}",
+                        element_type="table_row",
+                        source_metadata={
+                            "section_path": "CSV",
+                            "row_index": row_count,
+                            "headers": list(reader.fieldnames),
+                            "table_index": 1,
+                        },
+                    )
+                )
         if not chunks:
             raise ValueError("CSV contains no readable data rows")
         return chunks, row_count
@@ -725,7 +941,8 @@ class DocumentIngestionService:
                 if buffer and buffer[-1] != "":
                     buffer.append("")
                 continue
-            if _HEADING_PATTERN.match(display_line) and len(display_line) <= 250:
+            if (_HEADING_PATTERN.match(display_line) and len(display_line) <= 250
+                    and not self._is_numbered_step(display_line)):
                 flush()
                 current_section = display_line
                 continue
@@ -733,9 +950,25 @@ class DocumentIngestionService:
         flush()
         return result, current_section
 
-    def _split_buffer(self, text: str, page: int, section: str | None) -> list[ParsedChunk]:
+    def _split_buffer(
+        self,
+        text: str,
+        page: int,
+        section: str | None,
+        *,
+        element_type: str = "text",
+        source_metadata: dict | None = None,
+    ) -> list[ParsedChunk]:
         if len(text) <= self.chunk_size:
-            return [ParsedChunk(page=page, section=section, content=text)]
+            return [
+                ParsedChunk(
+                    page=page,
+                    section=section,
+                    content=text,
+                    element_type=element_type,
+                    source_metadata=source_metadata,
+                )
+            ]
         chunks: list[ParsedChunk] = []
         start = 0
         while start < len(text):
@@ -744,7 +977,15 @@ class DocumentIngestionService:
                 end = self._semantic_break(text, start, end)
             # Do not left-strip: indentation is meaningful in bullet lists and
             # tables, and the same content is shown in the citation reader.
-            chunks.append(ParsedChunk(page=page, section=section, content=text[start:end].rstrip()))
+            chunks.append(
+                ParsedChunk(
+                    page=page,
+                    section=section,
+                    content=text[start:end].rstrip(),
+                    element_type=element_type,
+                    source_metadata=source_metadata,
+                )
+            )
             if end >= len(text):
                 break
             # Retain neighbouring context for retrieval while forcing at least
@@ -798,9 +1039,28 @@ class DocumentIngestionService:
         return re.sub(r"\s*\n\s*", " ", repaired).strip()
 
     @staticmethod
-    def _looks_like_table_header(row: list[str]) -> bool:
+    def _is_numbered_step(line: str) -> bool:
+        match = re.match(r"^\d+\.\s+(.+)$", line)
+        if not match:
+            return False
+        body = match.group(1)
+        first = body.split()[0].casefold()
+        return (body.endswith((".", ":", ";", "!", "?")) or len(body.split()) > 8
+                or first in {"click", "select", "connect", "navigate", "open", "close", "enter",
+                             "press", "turn", "wait", "after", "before", "remove", "install",
+                             "verify", "check", "repeat", "make", "ensure", "note", "set"})
+
+    @staticmethod
+    def _plausible_table_header(row: list[str]) -> bool:
+        populated = [value.strip() for value in row if value.strip()]
+        return (len(populated) >= 2 and
+                all(len(value) <= 100 and len(value.split()) <= 12 and
+                    not value.endswith((".", "!", "?")) for value in populated))
+
+    @classmethod
+    def _looks_like_table_header(cls, row: list[str]) -> bool:
         values = [value.casefold() for value in row if value]
-        if not values:
+        if not values or any(len(value) > 100 or len(value.split()) > 12 for value in values):
             return False
         header_terms = (
             "danger",

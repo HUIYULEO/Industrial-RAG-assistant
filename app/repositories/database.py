@@ -51,6 +51,9 @@ def initialise_database() -> None:
             "citation_chunk_id": "VARCHAR(36)",
         },
         "document_versions": {
+            "parse_dispatch_version": "INTEGER NOT NULL DEFAULT 0",
+            "parse_started_at": "TIMESTAMP WITH TIME ZONE",
+            "parse_owner": "VARCHAR(36)",
             "archived_at": "TIMESTAMP WITH TIME ZONE",
             "archived_by_user_id": "VARCHAR(36)",
             "archived_reason": "TEXT",

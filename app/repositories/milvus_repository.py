@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from time import perf_counter
 
 from app.domain.evidence import EvidenceChunk, RetrievalFilters
+from app.services.trace_capture import branches_enabled, capture_error, record
 
 KNOWLEDGE_CHUNKS_COLLECTION = "knowledge_chunks"
 
@@ -47,6 +49,7 @@ class MilvusChunkRepository:
         query_vector: list[float],
         filters: RetrievalFilters,
         limit: int,
+        candidate_limit: int | None = None,
     ) -> list[EvidenceChunk]:
         """Fuse BM25 and dense results with RRF inside a selected review scope."""
         from pymilvus import AnnSearchRequest, RRFRanker
@@ -55,7 +58,9 @@ class MilvusChunkRepository:
         try:
             self._ensure_collection(client)
             expression = self._filter_expression(filters)
-            candidate_limit = max(limit * 3, 15)
+            candidate_limit = max(limit * 3, 15) if candidate_limit is None else candidate_limit
+            if candidate_limit < 1:
+                raise ValueError("candidate_limit must be positive")
             dense_request = AnnSearchRequest(
                 data=[query_vector],
                 anns_field="dense_vector",
@@ -70,10 +75,12 @@ class MilvusChunkRepository:
                 limit=candidate_limit,
                 expr=expression,
             )
+            ranker = RRFRanker()
+            started = perf_counter()
             results = client.hybrid_search(
                 collection_name=self.collection_name,
                 reqs=[dense_request, sparse_request],
-                ranker=RRFRanker(),
+                ranker=ranker,
                 limit=limit,
                 output_fields=[
                     "chunk_id",
@@ -108,9 +115,55 @@ class MilvusChunkRepository:
                             fused_score=float(hit["distance"]),
                         )
                     )
+            record("hybrid_search", {
+                "query": query_text, "collection": self.collection_name,
+                "filter": expression, "candidate_limit": candidate_limit, "limit": limit,
+                "ranker": ranker.dict(),
+                "duration_ms": round((perf_counter() - started) * 1000, 3),
+                "results": [{"chunk_id": chunk.chunk_id, "rank": rank,
+                             "score": chunk.fused_score}
+                            for rank, chunk in enumerate(evidence, 1)],
+            })
+            if branches_enabled():
+                self._capture_branches(client, query_text, query_vector, expression, candidate_limit)
             return evidence
         finally:
             client.close()
+
+    def _capture_branches(self, client, query_text, query_vector, expression, candidate_limit):
+        """Shadow searches do not feed business ranking or claim server-internal provenance.
+
+        Milvus hybrid_search returns only fused hits. Separate ANN calls may differ
+        under concurrent indexing/approximation, so these are diagnostic observations.
+        """
+        for branch, data, field, metric in (
+            ("dense", query_vector, "dense_vector", "COSINE"),
+            ("bm25", query_text, "sparse_vector", "BM25"),
+        ):
+            started = perf_counter()
+            try:
+                results = client.search(
+                    collection_name=self.collection_name, data=[data], anns_field=field,
+                    search_params={"metric_type": metric}, filter=expression,
+                    limit=candidate_limit, output_fields=["chunk_id"], timeout=5,
+                )
+                hits = [hit for group in results for hit in group]
+                candidates = []
+                for rank, hit in enumerate(hits, 1):
+                    chunk_id = hit.get("chunk_id") or hit.get("entity", {}).get("chunk_id") or hit.get("id")
+                    if not chunk_id:
+                        raise ValueError("Diagnostic candidate missing chunk ID")
+                    candidates.append({"chunk_id": str(chunk_id), "rank": rank,
+                                       "score": float(hit["distance"])})
+                record("branch_search", {
+                    "query": query_text, "branch": branch,
+                    "provenance": "independent_shadow_search_after_hybrid",
+                    "metric": metric, "limit": candidate_limit, "filter": expression,
+                    "duration_ms": round((perf_counter() - started) * 1000, 3),
+                    "results": candidates,
+                })
+            except Exception as exc:
+                capture_error(f"branch_{branch}", exc)
 
     def _client(self):
         from pymilvus import MilvusClient
